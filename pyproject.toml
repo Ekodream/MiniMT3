@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minimt3-piano"
+version = "0.1.0"
+description = "MiniMT3-Piano: compact piano AMT with constrained decoding and score rendering."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "pyyaml>=6.0",
+  "torch>=2.1",
+  "torchaudio>=2.1",
+  "pretty_midi>=0.2.10",
+  "music21>=9.1",
+  "gradio>=4.0",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+eval = ["mir_eval>=0.7"]
+dev = ["pytest>=7.4", "ruff>=0.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

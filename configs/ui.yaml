@@ -1,0 +1,6 @@
+infer_config: configs/infer.yaml
+checkpoint: outputs/ckpt/best.pt
+output_dir: outputs/ui
+server_name: 127.0.0.1
+server_port: 7860
+share: false
