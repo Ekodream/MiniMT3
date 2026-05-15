@@ -7,8 +7,9 @@ audio:
   f_max: 8000.0
 events:
   time_shift_ms: 10
-  max_time_shift_steps: 100
+  max_time_shift_steps: 3000
   velocity_bins: 32
+  time_mode: absolute
 model:
   d_model: 256
   encoder_layers: 4

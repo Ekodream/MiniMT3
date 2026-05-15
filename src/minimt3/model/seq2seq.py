@@ -52,3 +52,12 @@ class MiniMT3(nn.Module):
     def forward(self, features: torch.Tensor, decoder_input_ids: torch.Tensor) -> torch.Tensor:
         memory = self.encode(features)
         return self.decoder(decoder_input_ids, memory)
+
+    def decode_step(
+        self,
+        token: torch.Tensor,
+        memory: torch.Tensor,
+        cache: list[dict[str, torch.Tensor]] | None,
+        position: int,
+    ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
+        return self.decoder.step(token, memory, cache, position)

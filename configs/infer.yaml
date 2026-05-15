@@ -4,8 +4,12 @@ window_seconds: 30.0
 overlap_seconds: 2.0
 max_tokens: 4096
 decode:
-  mode: constrained_greedy
+  mode: fast_greedy
+  constrained: true
   beam_size: 4
+  repetition_penalty: 1.15
+  loop_window: 16
+  loop_repeats: 4
 cleanup:
   pedal_aware: true
   quantize: true

@@ -1,0 +1,5 @@
+metadata: data/cache/maestro_val_clips.json
+split: validation
+sampling: fixed
+seconds: 20.0
+model_config: configs/model.yaml

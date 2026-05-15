@@ -21,8 +21,9 @@ def build_codec(model_config: dict[str, Any]) -> EventCodec:
     event_cfg = model_config.get("events", {})
     return EventCodec(
         time_shift_ms=event_cfg.get("time_shift_ms", 10),
-        max_time_shift_steps=event_cfg.get("max_time_shift_steps", 100),
+        max_time_shift_steps=event_cfg.get("max_time_shift_steps", 1000),
         velocity_bins=event_cfg.get("velocity_bins", 32),
+        time_mode=event_cfg.get("time_mode", "absolute"),
     )
 
 
@@ -49,6 +50,8 @@ def load_checkpoint(ckpt_path: str | Path, device: str | torch.device = "cpu") -
     model_config = ckpt.get("model_config")
     if model_config is None:
         raise ValueError("Checkpoint is missing model_config.")
+    if ckpt.get("codec_config"):
+        model_config = {**model_config, "events": {**model_config.get("events", {}), **ckpt["codec_config"]}}
     codec = build_codec(model_config)
     model = build_model(model_config, codec)
     model.load_state_dict(ckpt["model"])
@@ -77,9 +80,11 @@ def transcribe_audio(
     overlap = float(infer_config.get("overlap_seconds", 2.0))
     max_tokens = int(infer_config.get("max_tokens", 4096))
     decode_cfg = infer_config.get("decode", {})
-    mode = decode_cfg.get("mode", "constrained_greedy")
+    mode = decode_cfg.get("mode", "fast_greedy")
     beam_size = int(decode_cfg.get("beam_size", 4))
     constrained = "constrained" in mode
+    if mode.startswith("fast_"):
+        constrained = decode_cfg.get("constrained", True)
 
     total_seconds = waveform.shape[-1] / sr
     starts = [0.0]
@@ -102,24 +107,30 @@ def transcribe_audio(
             if chunk.numel() == 0:
                 continue
             features = extractor(chunk.to(device)).squeeze(0)
-            if mode == "beam":
-                token_ids = beam_decode(
+            if mode in {"beam", "fast_beam"}:
+                token_ids, stats = beam_decode(
                     model,
                     features,
                     codec,
                     beam_size=beam_size,
                     max_tokens=max_tokens,
                     constrained=constrained,
+                    repetition_penalty=float(decode_cfg.get("repetition_penalty", 1.1)),
+                    return_stats=True,
                 )
             else:
-                token_ids = greedy_decode(
+                token_ids, stats = greedy_decode(
                     model,
                     features,
                     codec,
                     max_tokens=max_tokens,
                     constrained=constrained,
+                    repetition_penalty=float(decode_cfg.get("repetition_penalty", 1.15)),
+                    loop_window=int(decode_cfg.get("loop_window", 16)),
+                    loop_repeats=int(decode_cfg.get("loop_repeats", 4)),
+                    return_stats=True,
                 )
-            decoded = codec.decode(token_ids)
+            decoded = codec.decode(token_ids, stop_reason=stats.stop_reason)
             notes, pedals = offset_events(decoded.notes, decoded.pedals, start)
             all_notes.extend(notes)
             all_pedals.extend(pedals)
@@ -127,6 +138,12 @@ def transcribe_audio(
                 {
                     "start": start,
                     "tokens": token_ids,
+                    "token_family_counts": codec.token_family_counts(token_ids),
+                    "eos_hit": decoded.eos_hit,
+                    "stop_reason": stats.stop_reason,
+                    "decode_wall_time": stats.wall_time,
+                    "tokens_per_second": stats.tokens_per_second,
+                    "topk_snapshots": stats.topk_snapshots,
                     "invalid_event_rate": decoded.invalid_events / max(1, decoded.total_events),
                 }
             )

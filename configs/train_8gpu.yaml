@@ -1,7 +1,7 @@
 seed: 42
 metadata: data/cache/maestro_index.json
 val_metadata: data/cache/maestro_val_clips.json
-output_dir: outputs/ckpt
+output_dir: outputs/ckpt_8gpu
 split: train
 val_split: validation
 max_items:
@@ -12,8 +12,8 @@ train_sampling: random
 val_sampling: fixed
 batch_size: 2
 eval_batch_size: 2
-num_workers: 2
-epochs: 5
+num_workers: 8
+epochs: 40
 lr: 0.0003
 weight_decay: 0.01
 betas: [0.9, 0.98]
@@ -30,8 +30,8 @@ family_weights:
   EOS: 1.5
 allow_tf32: true
 compile: false
-prefetch_factor: 2
+prefetch_factor: 4
 log_interval: 20
-eval_interval: 500
-save_interval: 500
+eval_interval: 1000
+save_interval: 1000
 model_config: configs/model.yaml
