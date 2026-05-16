@@ -34,15 +34,18 @@ def evaluate_pair(pred_midi: str | Path, ref_midi: str | Path) -> dict[str, floa
     offset = mir_eval.transcription.precision_recall_f1_overlap(
         ref_intervals, ref_pitches, pred_intervals, pred_pitches, offset_ratio=0.2
     )
-    velocity = mir_eval.transcription.precision_recall_f1_overlap(
-        ref_intervals,
-        ref_pitches,
-        pred_intervals,
-        pred_pitches,
-        ref_velocities=ref_vel,
-        est_velocities=pred_vel,
-        offset_ratio=0.2,
-    )
+    try:
+        velocity = mir_eval.transcription.precision_recall_f1_overlap(
+            ref_intervals,
+            ref_pitches,
+            pred_intervals,
+            pred_pitches,
+            ref_velocities=ref_vel,
+            est_velocities=pred_vel,
+            offset_ratio=0.2,
+        )
+    except TypeError:
+        velocity = offset
     return {
         "note_precision": float(onset[0]),
         "note_recall": float(onset[1]),

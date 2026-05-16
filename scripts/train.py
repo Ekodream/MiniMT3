@@ -17,8 +17,10 @@ from tqdm import tqdm
 
 from minimt3.audio.features import LogMelConfig
 from minimt3.data import Collator, MaestroDataset, summarize_token_targets
+from minimt3.decode.beam_search import greedy_decode
 from minimt3.model.loss import WeightedSeq2SeqLoss
 from minimt3.pipeline import build_codec, build_model
+from minimt3.symbolic.events import NoteEvent, load_midi_events
 from minimt3.utils import ensure_dir, read_yaml, seed_everything
 
 
@@ -130,13 +132,17 @@ def main() -> None:
     out_dir = ensure_dir(cfg.get("output_dir", "outputs/ckpt"))
     global_step = 0
     best_val = float("inf")
+    last_val: dict[str, Any] | None = None
     if args.resume:
         global_step, best_val = load_training_state(
             args.resume, model, optimizer, scheduler, scaler, device, rank
         )
 
     grad_accum = int(cfg.get("grad_accum", 1))
+    max_steps = int(cfg.get("max_steps") or 0)
     for epoch in range(int(cfg.get("epochs", 5))):
+        if max_steps and global_step >= max_steps:
+            break
         train_ds.set_epoch(epoch)
         if train_sampler:
             train_sampler.set_epoch(epoch)
@@ -168,7 +174,9 @@ def main() -> None:
                     print(f"step={global_step} train_loss={loss_out.loss.item():.4f} lr={lr:.3e} {fam}")
                 if rank == 0 and global_step % int(cfg.get("eval_interval", 500)) == 0:
                     val = evaluate(model, val_loader, criterion, device, use_amp, amp_dtype)
+                    last_val = val
                     print(f"step={global_step} fixed_val_loss={val['loss']:.4f} {val['families']}")
+                    maybe_run_debug_decode(model, val_ds, codec, cfg, global_step, device)
                     if val["loss"] < best_val:
                         best_val = val["loss"]
                         save_checkpoint(
@@ -193,12 +201,15 @@ def main() -> None:
                         scheduler,
                         scaler,
                         global_step,
-                        None,
+                        last_val["loss"] if last_val else None,
                         cfg,
                     )
+                if max_steps and global_step >= max_steps:
+                    break
 
     if rank == 0:
         val = evaluate(model, val_loader, criterion, device, use_amp, amp_dtype)
+        print(f"step={global_step} final_fixed_val_loss={val['loss']:.4f} {val['families']}")
         save_checkpoint(
             out_dir / "last.pt",
             model,
@@ -247,6 +258,141 @@ def evaluate(model, loader, criterion, device, use_amp: bool, amp_dtype: torch.d
         "loss": sum(losses) / max(1, len(losses)),
         "families": {k: sum(v) / len(v) for k, v in family_accum.items()},
     }
+
+
+@torch.no_grad()
+def maybe_run_debug_decode(
+    model,
+    dataset: MaestroDataset,
+    codec,
+    cfg: dict[str, Any],
+    global_step: int,
+    device: torch.device,
+) -> None:
+    debug_cfg = cfg.get("debug_decode", {})
+    if not debug_cfg or not debug_cfg.get("enabled", False):
+        return
+
+    module = model.module if hasattr(model, "module") else model
+    max_items = min(int(debug_cfg.get("max_items", 2)), len(dataset))
+    max_tokens = int(debug_cfg.get("max_tokens", 1600))
+    constrained = bool(debug_cfg.get("constrained", True))
+    repetition_penalty = float(debug_cfg.get("repetition_penalty", 1.15))
+    loop_window = int(debug_cfg.get("loop_window", 16))
+    loop_repeats = int(debug_cfg.get("loop_repeats", 4))
+
+    rows = getattr(dataset, "rows", [])
+    items = []
+    module.eval()
+    for index in range(max_items):
+        sample = dataset[index]
+        row = rows[index] if index < len(rows) else {}
+        features = sample["features"].to(device, non_blocking=True)
+        tokens, stats = greedy_decode(
+            module,
+            features,
+            codec,
+            max_tokens=max_tokens,
+            constrained=constrained,
+            repetition_penalty=repetition_penalty,
+            loop_window=loop_window,
+            loop_repeats=loop_repeats,
+            return_stats=True,
+        )
+        decoded = codec.decode(tokens, stop_reason=stats.stop_reason)
+        ref_notes, _ = load_midi_events(
+            row.get("midi"),
+            start=float(row.get("start_sec", 0.0)),
+            end=float(row.get("end_sec", row.get("duration", 0.0) or 0.0)),
+        )
+        metric = _note_metrics(decoded.notes, ref_notes)
+        invalid_rate = decoded.invalid_events / max(1, decoded.total_events)
+        is_loop = "loop" in stats.stop_reason
+        item = {
+            "eos": float(decoded.eos_hit),
+            "loop": float(is_loop),
+            "pred_notes": len(decoded.notes),
+            "ref_notes": len(ref_notes),
+            "note_f1": metric["note_f1"],
+            "offset_f1": metric["offset_f1"],
+        }
+        items.append(item)
+        print(
+            "debug_decode "
+            f"step={global_step} item={index} clip_id={row.get('clip_id', index)} "
+            f"eos={decoded.eos_hit} stop={stats.stop_reason} "
+            f"pred_notes={len(decoded.notes)} ref_notes={len(ref_notes)} "
+            f"note_f1={metric['note_f1']:.4f} offset_f1={metric['offset_f1']:.4f} "
+            f"invalid={invalid_rate:.4f} decode_s={stats.wall_time:.2f} "
+            f"tok_s={stats.tokens_per_second:.2f}"
+        )
+    module.train()
+
+    if not items:
+        return
+    eos_rate = sum(x["eos"] for x in items) / len(items)
+    loop_rate = sum(x["loop"] for x in items) / len(items)
+    note_f1 = sum(x["note_f1"] for x in items) / len(items)
+    offset_f1 = sum(x["offset_f1"] for x in items) / len(items)
+    pred_notes = sum(x["pred_notes"] for x in items)
+    ref_notes = sum(x["ref_notes"] for x in items)
+    pred_ref_ratio = pred_notes / max(1, ref_notes)
+    print(
+        "debug_decode_summary "
+        f"step={global_step} eos_hit_rate={eos_rate:.3f} loop_rate={loop_rate:.3f} "
+        f"pred_ref_ratio={pred_ref_ratio:.3f} note_f1={note_f1:.4f} "
+        f"offset_f1={offset_f1:.4f} pred_notes={pred_notes} ref_notes={ref_notes}"
+    )
+
+
+def _note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dict[str, float]:
+    try:
+        import mir_eval.transcription
+        import numpy as np
+    except ImportError:
+        return _simple_note_metrics(pred_notes, ref_notes)
+
+    ref_intervals, ref_pitches = _note_arrays(ref_notes, np)
+    pred_intervals, pred_pitches = _note_arrays(pred_notes, np)
+    onset = mir_eval.transcription.precision_recall_f1_overlap(
+        ref_intervals,
+        ref_pitches,
+        pred_intervals,
+        pred_pitches,
+        offset_ratio=None,
+    )
+    offset = mir_eval.transcription.precision_recall_f1_overlap(
+        ref_intervals,
+        ref_pitches,
+        pred_intervals,
+        pred_pitches,
+        offset_ratio=0.2,
+    )
+    return {"note_f1": float(onset[2]), "offset_f1": float(offset[2])}
+
+
+def _note_arrays(notes: list[NoteEvent], np_module):
+    if not notes:
+        return np_module.zeros((0, 2)), np_module.zeros((0,), dtype=int)
+    intervals = np_module.array([[n.start, n.end] for n in notes], dtype=float)
+    pitches = np_module.array([n.pitch for n in notes], dtype=int)
+    return intervals, pitches
+
+
+def _simple_note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dict[str, float]:
+    matched = set()
+    hits = 0
+    for pred in pred_notes:
+        for idx, ref in enumerate(ref_notes):
+            if idx in matched or pred.pitch != ref.pitch or abs(pred.start - ref.start) > 0.05:
+                continue
+            matched.add(idx)
+            hits += 1
+            break
+    precision = hits / max(1, len(pred_notes))
+    recall = hits / max(1, len(ref_notes))
+    f1 = 2 * precision * recall / max(1e-8, precision + recall)
+    return {"note_f1": f1, "offset_f1": 0.0}
 
 
 def save_checkpoint(
@@ -298,6 +444,8 @@ def load_training_state(path, model, optimizer, scheduler, scaler, device, rank:
 
 
 def _estimate_updates(cfg: dict, loader: DataLoader) -> int:
+    if cfg.get("max_steps"):
+        return max(int(cfg["max_steps"]), int(cfg.get("warmup_steps", 4000)) + 1)
     steps_per_epoch = max(1, len(loader) // int(cfg.get("grad_accum", 1)))
     return max(steps_per_epoch * int(cfg.get("epochs", 5)), int(cfg.get("warmup_steps", 4000)) + 1)
 
