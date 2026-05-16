@@ -59,5 +59,6 @@ class MiniMT3(nn.Module):
         memory: torch.Tensor,
         cache: list[dict[str, torch.Tensor]] | None,
         position: int,
+        max_length: int | None = None,
     ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
-        return self.decoder.step(token, memory, cache, position)
+        return self.decoder.step(token, memory, cache, position, max_length=max_length)

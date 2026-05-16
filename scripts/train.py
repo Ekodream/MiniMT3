@@ -71,8 +71,12 @@ def main() -> None:
     )
 
     if rank == 0:
-        print("train token summary:", summarize_token_targets(train_ds, codec, max_items=32))
-        print("fixed val token summary:", summarize_token_targets(val_ds, codec, max_items=min(32, len(val_ds))))
+        train_summary = summarize_token_targets(train_ds, codec, max_items=32)
+        val_summary = summarize_token_targets(val_ds, codec, max_items=min(32, len(val_ds)))
+        print("train token summary:", train_summary)
+        print("fixed val token summary:", val_summary)
+        _validate_token_summary("train", train_summary, cfg)
+        _validate_token_summary("fixed val", val_summary, cfg)
 
     train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True) if is_ddp else None
     collate = Collator(codec.pad_id)
@@ -113,6 +117,7 @@ def main() -> None:
         codec,
         label_smoothing=float(cfg.get("label_smoothing", 0.05)),
         family_weights=cfg.get("family_weights"),
+        eos_aux_weight=float(cfg.get("eos_aux_weight", 0.0)),
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -123,7 +128,11 @@ def main() -> None:
     total_updates = _estimate_updates(cfg, train_loader)
     scheduler = LambdaLR(
         optimizer,
-        lr_lambda=_warmup_cosine_lambda(int(cfg.get("warmup_steps", 4000)), total_updates),
+        lr_lambda=_warmup_cosine_lambda(
+            int(cfg.get("warmup_steps", 4000)),
+            total_updates,
+            min_lr_ratio=float(cfg.get("min_lr", 0.0)) / float(cfg.get("lr", 3e-4)),
+        ),
     )
     precision = cfg.get("precision", "bf16")
     amp_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
@@ -260,6 +269,16 @@ def evaluate(model, loader, criterion, device, use_amp: bool, amp_dtype: torch.d
     }
 
 
+def _validate_token_summary(name: str, summary: dict[str, Any], cfg: dict[str, Any]) -> None:
+    if summary["eos_rate"] < 1.0:
+        raise ValueError(f"{name} target eos_rate must be 1.0, got {summary['eos_rate']:.4f}")
+    max_target_tokens = int(cfg.get("max_target_tokens") or 0)
+    if max_target_tokens and summary["max_target_length"] > max_target_tokens:
+        raise ValueError(
+            f"{name} max target length {summary['max_target_length']} exceeds max_target_tokens={max_target_tokens}"
+        )
+
+
 @torch.no_grad()
 def maybe_run_debug_decode(
     model,
@@ -280,6 +299,9 @@ def maybe_run_debug_decode(
     repetition_penalty = float(debug_cfg.get("repetition_penalty", 1.15))
     loop_window = int(debug_cfg.get("loop_window", 16))
     loop_repeats = int(debug_cfg.get("loop_repeats", 4))
+    max_time_seconds = debug_cfg.get("max_time_seconds")
+    if max_time_seconds is not None:
+        max_time_seconds = float(max_time_seconds)
 
     rows = getattr(dataset, "rows", [])
     items = []
@@ -297,6 +319,12 @@ def maybe_run_debug_decode(
             repetition_penalty=repetition_penalty,
             loop_window=loop_window,
             loop_repeats=loop_repeats,
+            max_time_seconds=max_time_seconds,
+            eos_bias_after_seconds=debug_cfg.get("eos_bias_after_seconds"),
+            eos_logit_bias=float(debug_cfg.get("eos_logit_bias", 0.0)),
+            eos_bias_after_token_ratio=debug_cfg.get("eos_bias_after_token_ratio"),
+            force_eos_on_loop=bool(debug_cfg.get("force_eos_on_loop", False)),
+            max_tokens_since_shift=debug_cfg.get("max_tokens_since_shift"),
             return_stats=True,
         )
         decoded = codec.decode(tokens, stop_reason=stats.stop_reason)
@@ -450,12 +478,15 @@ def _estimate_updates(cfg: dict, loader: DataLoader) -> int:
     return max(steps_per_epoch * int(cfg.get("epochs", 5)), int(cfg.get("warmup_steps", 4000)) + 1)
 
 
-def _warmup_cosine_lambda(warmup_steps: int, total_steps: int):
+def _warmup_cosine_lambda(warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.0):
+    min_lr_ratio = max(0.0, min(1.0, min_lr_ratio))
+
     def fn(step: int) -> float:
         if step < warmup_steps:
             return max(1e-8, step / max(1, warmup_steps))
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return fn
 

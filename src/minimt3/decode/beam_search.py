@@ -30,6 +30,12 @@ def greedy_decode(
     loop_window: int = 16,
     loop_repeats: int = 4,
     min_time_for_eos: float = 0.5,
+    max_time_seconds: float | None = None,
+    eos_bias_after_seconds: float | None = None,
+    eos_logit_bias: float = 0.0,
+    eos_bias_after_token_ratio: float | None = None,
+    force_eos_on_loop: bool = False,
+    max_tokens_since_shift: int | None = None,
     return_stats: bool = False,
 ) -> list[int] | tuple[list[int], DecodeStats]:
     model.eval()
@@ -45,10 +51,21 @@ def greedy_decode(
     stats = DecodeStats()
     started = time.perf_counter()
     for position in range(max_tokens):
-        logits, cache = model.decode_step(current, memory, cache, position)
+        logits, cache = model.decode_step(current, memory, cache, position, max_length=max_tokens)
         logits = logits[0]
         if constrained:
             logits = apply_constraints(logits, state, min_time_for_eos=min_time_for_eos)
+        logits = _apply_eos_bias(
+            logits,
+            codec,
+            state,
+            position=position,
+            max_tokens=max_tokens,
+            max_time_seconds=max_time_seconds,
+            eos_bias_after_seconds=eos_bias_after_seconds,
+            eos_logit_bias=eos_logit_bias,
+            eos_bias_after_token_ratio=eos_bias_after_token_ratio,
+        )
         logits = _apply_repetition_penalty(logits, tokens, repetition_penalty)
         if position < 3:
             values, indices = torch.topk(torch.softmax(logits, dim=-1), k=min(8, logits.numel()))
@@ -67,15 +84,68 @@ def greedy_decode(
             stats.stop_reason = "eos"
             break
         if _detect_loop(tokens, loop_window=loop_window, repeats=loop_repeats):
-            stats.stop_reason = "loop_detected"
+            if force_eos_on_loop and state.current_time >= min_time_for_eos and not state.pending_velocity:
+                tokens.append(codec.eos_id)
+                stats.eos_hit = True
+                stats.stop_reason = "loop_forced_eos"
+            else:
+                stats.stop_reason = "loop_detected"
+            break
+        if max_tokens_since_shift is not None and state.tokens_since_shift > max_tokens_since_shift:
+            if force_eos_on_loop and state.current_time >= min_time_for_eos and not state.pending_velocity:
+                tokens.append(codec.eos_id)
+                stats.eos_hit = True
+                stats.stop_reason = "no_shift_forced_eos"
+            else:
+                stats.stop_reason = "too_many_tokens_without_shift"
             break
         if state.repeated_pitch_count > 12 or state.no_time_progress > 64:
-            stats.stop_reason = "state_loop_detected"
+            if force_eos_on_loop and state.current_time >= min_time_for_eos and not state.pending_velocity:
+                tokens.append(codec.eos_id)
+                stats.eos_hit = True
+                stats.stop_reason = "state_loop_forced_eos"
+            else:
+                stats.stop_reason = "state_loop_detected"
+            break
+        if max_time_seconds is not None and state.current_time >= max_time_seconds:
+            if force_eos_on_loop and not state.pending_velocity:
+                tokens.append(codec.eos_id)
+                stats.eos_hit = True
+                stats.stop_reason = "max_time_forced_eos"
+            else:
+                stats.stop_reason = "max_time"
             break
         current = torch.tensor([next_id], dtype=torch.long, device=device)
     stats.wall_time = time.perf_counter() - started
     stats.tokens_per_second = (len(tokens) - 1) / max(stats.wall_time, 1e-6)
     return (tokens, stats) if return_stats else tokens
+
+
+def _apply_eos_bias(
+    logits: torch.Tensor,
+    codec: EventCodec,
+    state: ConstraintState,
+    position: int,
+    max_tokens: int,
+    max_time_seconds: float | None,
+    eos_bias_after_seconds: float | None,
+    eos_logit_bias: float,
+    eos_bias_after_token_ratio: float | None,
+) -> torch.Tensor:
+    if eos_logit_bias <= 0 or state.pending_velocity:
+        return logits
+    should_bias = False
+    if eos_bias_after_seconds is not None and state.current_time >= eos_bias_after_seconds:
+        should_bias = True
+    if max_time_seconds is not None and state.current_time >= 0.85 * max_time_seconds:
+        should_bias = True
+    if eos_bias_after_token_ratio is not None and position >= int(max_tokens * eos_bias_after_token_ratio):
+        should_bias = True
+    if not should_bias:
+        return logits
+    out = logits.clone()
+    out[codec.eos_id] += eos_logit_bias
+    return out
 
 
 @torch.no_grad()
@@ -98,6 +168,7 @@ def beam_decode(
             max_tokens=max_tokens,
             constrained=constrained,
             repetition_penalty=repetition_penalty,
+            max_time_seconds=None,
             return_stats=return_stats,
         )
     model.eval()
@@ -115,7 +186,7 @@ def beam_decode(
                 candidates.append((tokens, score, state, cache, done))
                 continue
             current = torch.tensor([tokens[-1]], dtype=torch.long, device=device)
-            logits, new_cache = model.decode_step(current, memory, cache, position)
+            logits, new_cache = model.decode_step(current, memory, cache, position, max_length=max_tokens)
             logits = logits[0]
             if constrained:
                 logits = apply_constraints(logits, state)

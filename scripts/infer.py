@@ -14,7 +14,7 @@ def main() -> None:
     parser.add_argument("--audio", required=True)
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--out", default="outputs/demo")
-    parser.add_argument("--config", default="configs/infer.yaml")
+    parser.add_argument("--config", default="configs/infer_relative.yaml")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

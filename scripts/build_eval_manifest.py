@@ -17,6 +17,7 @@ def main() -> None:
     parser.add_argument("--clip_seconds", type=float, default=20.0)
     parser.add_argument("--val_count", type=int, default=50)
     parser.add_argument("--debug_count", type=int, default=8)
+    parser.add_argument("--suffix", default="")
     args = parser.parse_args()
 
     rows = read_json(args.index)
@@ -24,8 +25,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     val = build_fixed_clip_manifest(rows, args.val_split, args.clip_seconds, args.val_count)
     debug = build_fixed_clip_manifest(rows, args.debug_split, args.clip_seconds, args.debug_count)
-    val_path = out_dir / "maestro_val_clips.json"
-    debug_path = out_dir / "maestro_debug_clips.json"
+    suffix = f"_{args.suffix}" if args.suffix else ""
+    val_path = out_dir / f"maestro_val_clips{suffix}.json"
+    debug_path = out_dir / f"maestro_debug_clips{suffix}.json"
     write_json(val_path, val)
     write_json(debug_path, debug)
     print(f"Wrote {len(val)} fixed validation clips to {val_path}")

@@ -71,13 +71,21 @@ class EventCodec:
         self.velocity_bins = velocity_bins
         self.time_mode = time_mode
         self.tokens = ["<PAD>", "<BOS>", "<EOS>", "<UNK>"]
-        self.tokens += [f"SHIFT_{i}" for i in range(0, max_time_shift_steps + 1)]
+        shift_start = 0 if time_mode == "absolute" else 1
+        self.tokens += [f"SHIFT_{i}" for i in range(shift_start, max_time_shift_steps + 1)]
         self.tokens += [f"VELOCITY_{i}" for i in range(velocity_bins + 1)]
         self.tokens += [f"PITCH_{p}" for p in range(PITCH_MIN, PITCH_MAX + 1)]
         self.tokens += ["PEDAL_ON", "PEDAL_OFF", "TIE"]
         self.token_to_id = {t: i for i, t in enumerate(self.tokens)}
         self.id_to_token = {i: t for t, i in self.token_to_id.items()}
         self.family_ranges = self._build_family_ranges()
+        self.shift_token_ids = [self.token_to_id[t] for t in self.tokens if t.startswith("SHIFT_")]
+        self.shift_steps = [int(self.id_to_token[i].rsplit("_", 1)[1]) for i in self.shift_token_ids]
+        self.velocity_token_ids = [self.token_to_id[t] for t in self.tokens if t.startswith("VELOCITY_")]
+        self.velocity_values = [int(self.id_to_token[i].rsplit("_", 1)[1]) for i in self.velocity_token_ids]
+        self.pitch_token_ids = [self.token_to_id[t] for t in self.tokens if t.startswith("PITCH_")]
+        self.pitch_values = [int(self.id_to_token[i].rsplit("_", 1)[1]) for i in self.pitch_token_ids]
+        self._tensor_cache: dict[str, dict[str, object]] = {}
 
     @property
     def pad_id(self) -> int:
@@ -120,6 +128,21 @@ class EventCodec:
 
     def token_family_counts(self, token_ids: Iterable[int]) -> dict[str, int]:
         return dict(Counter(self.token_family(i) for i in token_ids))
+
+    def constraint_tensors(self, device) -> dict[str, object]:
+        import torch
+
+        key = str(device)
+        if key not in self._tensor_cache:
+            self._tensor_cache[key] = {
+                "shift_ids": torch.tensor(self.shift_token_ids, dtype=torch.long, device=device),
+                "shift_steps": torch.tensor(self.shift_steps, dtype=torch.float32, device=device),
+                "velocity_ids": torch.tensor(self.velocity_token_ids, dtype=torch.long, device=device),
+                "velocity_values": torch.tensor(self.velocity_values, dtype=torch.long, device=device),
+                "pitch_ids": torch.tensor(self.pitch_token_ids, dtype=torch.long, device=device),
+                "pitch_values": torch.tensor(self.pitch_values, dtype=torch.long, device=device),
+            }
+        return self._tensor_cache[key]
 
     def velocity_to_bin(self, velocity: int) -> int:
         if velocity <= 0:

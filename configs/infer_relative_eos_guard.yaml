@@ -1,0 +1,27 @@
+model_config: configs/model_relative.yaml
+sample_rate: 16000
+window_seconds: 8.0
+overlap_seconds: 1.0
+max_tokens: 900
+decode:
+  mode: fast_greedy
+  constrained: true
+  beam_size: 4
+  repetition_penalty: 1.2
+  loop_window: 12
+  loop_repeats: 3
+  max_time_seconds: 8.5
+  eos_bias_after_seconds: 6.5
+  eos_logit_bias: 2.5
+  eos_bias_after_token_ratio: 0.75
+  force_eos_on_loop: true
+  max_tokens_since_shift: 96
+cleanup:
+  pedal_aware: true
+  quantize: true
+  quantize_step: 0.125
+render:
+  write_musicxml: true
+  write_png: false
+  write_pdf: false
+  write_svg: false

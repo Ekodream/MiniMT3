@@ -1,0 +1,20 @@
+audio:
+  sample_rate: 16000
+  n_mels: 128
+  n_fft: 1024
+  hop_length: 160
+  f_min: 30.0
+  f_max: 8000.0
+events:
+  time_shift_ms: 10
+  max_time_shift_steps: 1000
+  velocity_bins: 32
+  time_mode: relative
+model:
+  d_model: 256
+  encoder_layers: 4
+  decoder_layers: 4
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.1
+  conv_channels: 256

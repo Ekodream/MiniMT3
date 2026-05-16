@@ -128,6 +128,12 @@ def transcribe_audio(
                     repetition_penalty=float(decode_cfg.get("repetition_penalty", 1.15)),
                     loop_window=int(decode_cfg.get("loop_window", 16)),
                     loop_repeats=int(decode_cfg.get("loop_repeats", 4)),
+                    max_time_seconds=float(decode_cfg.get("max_time_seconds", window + 0.5)),
+                    eos_bias_after_seconds=decode_cfg.get("eos_bias_after_seconds"),
+                    eos_logit_bias=float(decode_cfg.get("eos_logit_bias", 0.0)),
+                    eos_bias_after_token_ratio=decode_cfg.get("eos_bias_after_token_ratio"),
+                    force_eos_on_loop=bool(decode_cfg.get("force_eos_on_loop", False)),
+                    max_tokens_since_shift=decode_cfg.get("max_tokens_since_shift"),
                     return_stats=True,
                 )
             decoded = codec.decode(token_ids, stop_reason=stats.stop_reason)

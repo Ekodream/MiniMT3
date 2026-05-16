@@ -211,6 +211,7 @@ class MaestroDataset(Dataset):
 def summarize_token_targets(dataset: Dataset, codec: EventCodec, max_items: int = 128) -> dict[str, Any]:
     family_counts: Counter[str] = Counter()
     lengths: list[int] = []
+    seconds: list[float] = []
     eos = 0
     for i in range(min(max_items, len(dataset))):
         if hasattr(dataset, "get_tokens"):
@@ -218,16 +219,27 @@ def summarize_token_targets(dataset: Dataset, codec: EventCodec, max_items: int 
         else:
             tokens = dataset[i]["tokens"].tolist()
         lengths.append(len(tokens))
+        rows = getattr(dataset, "rows", None)
+        if rows is not None and i < len(rows):
+            row = rows[i]
+            if "start_sec" in row and "end_sec" in row:
+                seconds.append(max(0.01, float(row["end_sec"]) - float(row["start_sec"])))
+            elif hasattr(dataset, "train_seconds"):
+                seconds.append(max(0.01, float(getattr(dataset, "train_seconds"))))
         eos += int(codec.eos_id in tokens)
         family_counts.update(codec.token_family(t) for t in tokens)
     total = sum(family_counts.values())
+    avg_length = sum(lengths) / max(1, len(lengths))
+    avg_seconds = sum(seconds) / max(1, len(seconds)) if seconds else None
     return {
         "items": len(lengths),
-        "avg_target_length": sum(lengths) / max(1, len(lengths)),
+        "avg_target_length": avg_length,
         "max_target_length": max(lengths) if lengths else 0,
         "eos_rate": eos / max(1, len(lengths)),
         "family_counts": dict(family_counts),
         "family_ratio": {k: v / max(1, total) for k, v in family_counts.items()},
+        "shift_token_density": family_counts.get("SHIFT", 0) / max(1, total),
+        "avg_tokens_per_second": (avg_length / avg_seconds) if avg_seconds else None,
     }
 
 
