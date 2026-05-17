@@ -34,6 +34,7 @@ class WeightedSeq2SeqLoss(nn.Module):
             "PEDAL": 1.2,
             "VELOCITY": 0.8,
             "SHIFT": 0.9,
+            "TIE": 1.2,
         }
         weights = torch.tensor(codec.family_mask(family_weights), dtype=torch.float32)
         self.register_buffer("weights", weights)
@@ -67,7 +68,7 @@ class WeightedSeq2SeqLoss(nn.Module):
         valid: torch.Tensor,
     ) -> dict[str, float]:
         out: dict[str, float] = {}
-        for family in ["SHIFT", "VELOCITY", "PITCH", "PEDAL", "EOS"]:
+        for family in ["SHIFT", "VELOCITY", "PITCH", "PEDAL", "TIE", "EOS"]:
             ids = [
                 token_id
                 for token_id in range(self.codec.vocab_size)

@@ -36,6 +36,9 @@ def greedy_decode(
     eos_bias_after_token_ratio: float | None = None,
     force_eos_on_loop: bool = False,
     max_tokens_since_shift: int | None = None,
+    max_same_time_events: int | None = None,
+    max_same_time_note_ons: int | None = None,
+    prefix_tokens: list[int] | None = None,
     return_stats: bool = False,
 ) -> list[int] | tuple[list[int], DecodeStats]:
     model.eval()
@@ -50,11 +53,27 @@ def greedy_decode(
     current = torch.tensor([codec.bos_id], dtype=torch.long, device=device)
     stats = DecodeStats()
     started = time.perf_counter()
-    for position in range(max_tokens):
+    position = 0
+    for prefix_id in prefix_tokens or []:
+        if len(tokens) >= max_tokens:
+            break
+        _, cache = model.decode_step(current, memory, cache, position, max_length=max_tokens)
+        prefix_id = int(prefix_id)
+        tokens.append(prefix_id)
+        state.update(prefix_id)
+        current = torch.tensor([prefix_id], dtype=torch.long, device=device)
+        position += 1
+    for decode_position in range(max_tokens - len(tokens) + 1):
         logits, cache = model.decode_step(current, memory, cache, position, max_length=max_tokens)
         logits = logits[0]
         if constrained:
-            logits = apply_constraints(logits, state, min_time_for_eos=min_time_for_eos)
+            logits = apply_constraints(
+                logits,
+                state,
+                min_time_for_eos=min_time_for_eos,
+                max_same_time_events=max_same_time_events,
+                max_same_time_note_ons=max_same_time_note_ons,
+            )
         logits = _apply_eos_bias(
             logits,
             codec,
@@ -67,7 +86,7 @@ def greedy_decode(
             eos_bias_after_token_ratio=eos_bias_after_token_ratio,
         )
         logits = _apply_repetition_penalty(logits, tokens, repetition_penalty)
-        if position < 3:
+        if decode_position < 3:
             values, indices = torch.topk(torch.softmax(logits, dim=-1), k=min(8, logits.numel()))
             stats.topk_snapshots.append(
                 {
@@ -116,6 +135,7 @@ def greedy_decode(
                 stats.stop_reason = "max_time"
             break
         current = torch.tensor([next_id], dtype=torch.long, device=device)
+        position += 1
     stats.wall_time = time.perf_counter() - started
     stats.tokens_per_second = (len(tokens) - 1) / max(stats.wall_time, 1e-6)
     return (tokens, stats) if return_stats else tokens

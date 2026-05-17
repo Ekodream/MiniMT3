@@ -107,6 +107,14 @@ def transcribe_audio(
             if chunk.numel() == 0:
                 continue
             features = extractor(chunk.to(device)).squeeze(0)
+            prefix_tokens: list[int] | None = None
+            if decode_cfg.get("carry_tie_state", False) and start > 0:
+                prefix_tokens = _tie_prefix_from_active_notes(
+                    all_notes,
+                    window_start=start,
+                    codec=codec,
+                    max_notes=int(decode_cfg.get("max_carry_ties", 16)),
+                )
             if mode in {"beam", "fast_beam"}:
                 token_ids, stats = beam_decode(
                     model,
@@ -134,6 +142,9 @@ def transcribe_audio(
                     eos_bias_after_token_ratio=decode_cfg.get("eos_bias_after_token_ratio"),
                     force_eos_on_loop=bool(decode_cfg.get("force_eos_on_loop", False)),
                     max_tokens_since_shift=decode_cfg.get("max_tokens_since_shift"),
+                    max_same_time_events=decode_cfg.get("max_same_time_events"),
+                    max_same_time_note_ons=decode_cfg.get("max_same_time_note_ons"),
+                    prefix_tokens=prefix_tokens,
                     return_stats=True,
                 )
             decoded = codec.decode(token_ids, stop_reason=stats.stop_reason)
@@ -145,6 +156,7 @@ def transcribe_audio(
                     "start": start,
                     "tokens": token_ids,
                     "token_family_counts": codec.token_family_counts(token_ids),
+                    "prefix_tokens": prefix_tokens or [],
                     "eos_hit": decoded.eos_hit,
                     "stop_reason": stats.stop_reason,
                     "decode_wall_time": stats.wall_time,
@@ -162,6 +174,30 @@ def transcribe_audio(
     if cleanup_cfg.get("quantize", False):
         notes = quantize_notes(notes, step=float(cleanup_cfg.get("quantize_step", 0.125)))
     return notes, pedals, debug
+
+
+def _tie_prefix_from_active_notes(
+    notes: list[NoteEvent],
+    window_start: float,
+    codec: EventCodec,
+    max_notes: int = 16,
+) -> list[int]:
+    active_by_pitch: dict[int, NoteEvent] = {}
+    for note in notes:
+        if note.start < window_start and note.end > window_start + 0.02:
+            current = active_by_pitch.get(note.pitch)
+            if current is None or note.end > current.end:
+                active_by_pitch[note.pitch] = note
+    active = [
+        NoteEvent(
+            pitch=note.pitch,
+            start=0.0,
+            end=max(0.01, note.end - window_start),
+            velocity=note.velocity,
+        )
+        for note in sorted(active_by_pitch.values(), key=lambda n: (n.pitch, -n.end))[:max_notes]
+    ]
+    return codec.encode_tie_prefix(active)
 
 
 def export_transcription(

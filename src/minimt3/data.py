@@ -124,6 +124,7 @@ class MaestroDataset(Dataset):
         max_items: int | None = None,
         sampling: str = "random",
         seed: int = 42,
+        include_ties: bool = False,
     ):
         if sampling not in {"random", "fixed"}:
             raise ValueError("sampling must be 'random' or 'fixed'")
@@ -135,6 +136,7 @@ class MaestroDataset(Dataset):
         self.feature_config = feature_config
         self.feature_extractor = LogMelExtractor(feature_config)
         self.train_seconds = train_seconds
+        self.include_ties = include_ties
 
         if _looks_like_clip_manifest(rows):
             self.rows = [
@@ -181,7 +183,13 @@ class MaestroDataset(Dataset):
         with torch.no_grad():
             features = self.feature_extractor(waveform)
         tokens = torch.tensor(
-            self.codec.encode_midi_file(row["midi"], start=start, end=end, add_special=True),
+            self.codec.encode_midi_file(
+                row["midi"],
+                start=start,
+                end=end,
+                add_special=True,
+                include_ties=self.include_ties,
+            ),
             dtype=torch.long,
         )
         return {"features": features, "tokens": tokens}
@@ -190,7 +198,13 @@ class MaestroDataset(Dataset):
         row = self.rows[index]
         start, end = self._clip_bounds(row, index)
         return torch.tensor(
-            self.codec.encode_midi_file(row["midi"], start=start, end=end, add_special=True),
+            self.codec.encode_midi_file(
+                row["midi"],
+                start=start,
+                end=end,
+                add_special=True,
+                include_ties=self.include_ties,
+            ),
             dtype=torch.long,
         )
 

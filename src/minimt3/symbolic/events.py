@@ -162,8 +162,23 @@ class EventCodec:
         add_special: bool = True,
         include_ties: bool = False,
     ) -> list[int]:
-        notes, pedals = load_midi_events(midi_path, start=start, end=end)
-        return self.encode_events(notes, pedals, add_special=add_special, include_ties=include_ties)
+        if include_ties:
+            notes, pedals, tie_notes = load_midi_events(
+                midi_path,
+                start=start,
+                end=end,
+                include_ties=True,
+            )
+        else:
+            notes, pedals = load_midi_events(midi_path, start=start, end=end)
+            tie_notes = []
+        return self.encode_events(
+            notes,
+            pedals,
+            add_special=add_special,
+            include_ties=include_ties,
+            tie_notes=tie_notes,
+        )
 
     def encode_events(
         self,
@@ -171,9 +186,10 @@ class EventCodec:
         pedals: Iterable[PedalEvent] = (),
         add_special: bool = True,
         include_ties: bool = False,
+        tie_notes: Iterable[NoteEvent] = (),
     ) -> list[int]:
-        del include_ties  # Reserved for a future state-prefix compatible manifest.
         cleaned_notes = _trim_overlapping_notes(_clean_notes(notes))
+        cleaned_ties = _trim_overlapping_notes(_clean_notes(tie_notes)) if include_ties else []
         cleaned_pedals = _clean_pedals(pedals)
         timeline: list[tuple[float, int, str]] = []
         for note in cleaned_notes:
@@ -182,6 +198,9 @@ class EventCodec:
             timeline.append((note.end, 1, f"PITCH_{note.pitch}"))
             timeline.append((note.start, 2, f"VELOCITY_{vel}"))
             timeline.append((note.start, 3, f"PITCH_{note.pitch}"))
+        for note in cleaned_ties:
+            timeline.append((note.end, 0, "VELOCITY_0"))
+            timeline.append((note.end, 1, f"PITCH_{note.pitch}"))
         for pedal in cleaned_pedals:
             timeline.append((pedal.start, 2, "PEDAL_ON"))
             timeline.append((pedal.end, 0, "PEDAL_OFF"))
@@ -189,8 +208,11 @@ class EventCodec:
 
         ids = [self.bos_id] if add_special else []
         cursor = 0.0
-        wrote_any_event = False
-        current_velocity: int | None = None
+        ids.extend(self.encode_tie_prefix(cleaned_ties))
+        current_velocity: int | None = (
+            self.velocity_to_bin(cleaned_ties[-1].velocity) if cleaned_ties else None
+        )
+        wrote_any_event = bool(cleaned_ties)
         pedal_active = False
         for time, _, token in timeline:
             time = max(0.0, time)
@@ -221,6 +243,15 @@ class EventCodec:
             ids.append(self.eos_id)
         return ids
 
+    def encode_tie_prefix(self, tie_notes: Iterable[NoteEvent]) -> list[int]:
+        ids: list[int] = []
+        for note in sorted(_clean_notes(tie_notes), key=lambda n: (n.pitch, n.end)):
+            velocity = self.velocity_to_bin(note.velocity)
+            ids.append(self.token_id("TIE"))
+            ids.append(self.token_id(f"VELOCITY_{velocity}"))
+            ids.append(self.token_id(f"PITCH_{note.pitch}"))
+        return ids
+
     def decode(
         self,
         token_ids: Iterable[int],
@@ -236,6 +267,7 @@ class EventCodec:
         invalid = 0
         total = 0
         eos_hit = False
+        pending_tie = False
 
         for token_id in token_ids:
             token = self.token(int(token_id))
@@ -246,12 +278,22 @@ class EventCodec:
                 eos_hit = True
                 break
             if token.startswith("SHIFT_"):
+                if pending_tie:
+                    invalid += 1
+                    pending_tie = False
                 shift = int(token.rsplit("_", 1)[1]) * self.step_seconds
                 time = shift if self.time_mode == "absolute" else time + shift
             elif token.startswith("VELOCITY_"):
                 velocity = self.bin_to_velocity(int(token.rsplit("_", 1)[1]))
             elif token.startswith("PITCH_"):
                 pitch = int(token.rsplit("_", 1)[1])
+                if pending_tie:
+                    if velocity <= 0 or pitch in active:
+                        invalid += 1
+                    else:
+                        active[pitch] = (0.0, velocity)
+                    pending_tie = False
+                    continue
                 if velocity == 0:
                     if pitch not in active:
                         invalid += 1
@@ -269,10 +311,16 @@ class EventCodec:
                             notes.append(NoteEvent(pitch, start, time, old_velocity))
                     active[pitch] = (time, velocity)
             elif token == "PEDAL_ON":
+                if pending_tie:
+                    invalid += 1
+                    pending_tie = False
                 if pedal_start is not None:
                     invalid += 1
                 pedal_start = time
             elif token == "PEDAL_OFF":
+                if pending_tie:
+                    invalid += 1
+                    pending_tie = False
                 if pedal_start is None:
                     invalid += 1
                     continue
@@ -280,7 +328,9 @@ class EventCodec:
                     pedals.append(PedalEvent(pedal_start, time))
                 pedal_start = None
             elif token == "TIE":
-                continue
+                if time > self.step_seconds / 2 or pending_tie:
+                    invalid += 1
+                pending_tie = True
             else:
                 invalid += 1
 
@@ -320,9 +370,10 @@ def load_midi_events(
     midi_path: str | Path,
     start: float = 0.0,
     end: float | None = None,
-) -> tuple[list[NoteEvent], list[PedalEvent]]:
+    include_ties: bool = False,
+) -> tuple[list[NoteEvent], list[PedalEvent]] | tuple[list[NoteEvent], list[PedalEvent], list[NoteEvent]]:
     midi = pretty_midi.PrettyMIDI(str(midi_path))
-    notes: list[NoteEvent] = []
+    note_rows: list[tuple[NoteEvent, bool]] = []
     for instrument in midi.instruments:
         if instrument.is_drum:
             continue
@@ -335,12 +386,16 @@ def load_midi_events(
             clipped_start = max(note_start, start) - start
             clipped_end = (min(note_end, end) if end is not None else note_end) - start
             if clipped_end > clipped_start:
-                notes.append(
-                    NoteEvent(
-                        pitch=note.pitch,
-                        start=clipped_start,
-                        end=clipped_end,
-                        velocity=note.velocity,
+                is_tie = bool(include_ties and note_start < start < note_end)
+                note_rows.append(
+                    (
+                        NoteEvent(
+                            pitch=note.pitch,
+                            start=clipped_start,
+                            end=clipped_end,
+                            velocity=note.velocity,
+                        ),
+                        is_tie,
                     )
                 )
 
@@ -363,7 +418,11 @@ def load_midi_events(
         if active_start is not None and end is not None and active_start < end:
             pedals.append(PedalEvent(max(active_start, start) - start, end - start))
         break
-    return _trim_overlapping_notes(_clean_notes(notes)), _clean_pedals(pedals)
+    notes, tie_notes = _trim_overlapping_note_rows(note_rows)
+    pedals = _clean_pedals(pedals)
+    if include_ties:
+        return notes, pedals, tie_notes
+    return notes, pedals
 
 
 def _clean_notes(notes: Iterable[NoteEvent], min_duration: float = 0.01) -> list[NoteEvent]:
@@ -377,6 +436,36 @@ def _clean_notes(notes: Iterable[NoteEvent], min_duration: float = 0.01) -> list
             continue
         clean.append(NoteEvent(int(note.pitch), start, end, max(1, min(127, int(note.velocity)))))
     return sorted(clean, key=lambda n: (n.pitch, n.start, n.end))
+
+
+def _trim_overlapping_note_rows(
+    note_rows: Iterable[tuple[NoteEvent, bool]],
+) -> tuple[list[NoteEvent], list[NoteEvent]]:
+    by_pitch: dict[int, list[tuple[NoteEvent, bool]]] = {}
+    for note, is_tie in note_rows:
+        cleaned = _clean_notes([note])
+        if not cleaned:
+            continue
+        by_pitch.setdefault(cleaned[0].pitch, []).append((cleaned[0], is_tie))
+
+    notes: list[NoteEvent] = []
+    tie_notes: list[NoteEvent] = []
+    for pitch, pitch_rows in by_pitch.items():
+        pitch_rows.sort(key=lambda row: (row[0].start, 0 if row[1] else 1, row[0].end))
+        for i, (note, is_tie) in enumerate(pitch_rows):
+            end = note.end
+            if i + 1 < len(pitch_rows):
+                end = min(end, pitch_rows[i + 1][0].start)
+            if end <= note.start:
+                continue
+            out = NoteEvent(pitch, note.start, end, note.velocity)
+            if is_tie:
+                tie_notes.append(out)
+            else:
+                notes.append(out)
+    notes.sort(key=lambda n: (n.start, n.pitch, n.end))
+    tie_notes.sort(key=lambda n: (n.pitch, n.end))
+    return notes, tie_notes
 
 
 def _trim_overlapping_notes(notes: Iterable[NoteEvent]) -> list[NoteEvent]:

@@ -46,6 +46,7 @@ def main() -> None:
 
     codec = build_codec(model_cfg)
     audio_cfg = LogMelConfig(**model_cfg.get("audio", {}))
+    include_ties = bool(cfg.get("include_ties", False))
     train_ds = MaestroDataset(
         cfg["metadata"],
         split=cfg.get("split", "train"),
@@ -55,6 +56,7 @@ def main() -> None:
         max_items=cfg.get("max_items"),
         sampling=cfg.get("train_sampling", "random"),
         seed=int(cfg.get("seed", 42)) + rank,
+        include_ties=include_ties,
     )
     val_sampling = cfg.get("val_sampling", "fixed")
     if val_sampling != "fixed":
@@ -68,6 +70,7 @@ def main() -> None:
         max_items=cfg.get("val_max_items", 64),
         sampling=val_sampling,
         seed=int(cfg.get("seed", 42)),
+        include_ties=include_ties,
     )
 
     if rank == 0:
@@ -141,9 +144,10 @@ def main() -> None:
     out_dir = ensure_dir(cfg.get("output_dir", "outputs/ckpt"))
     global_step = 0
     best_val = float("inf")
+    best_score = -math.inf
     last_val: dict[str, Any] | None = None
     if args.resume:
-        global_step, best_val = load_training_state(
+        global_step, best_val, best_score = load_training_state(
             args.resume, model, optimizer, scheduler, scaler, device, rank
         )
 
@@ -185,9 +189,11 @@ def main() -> None:
                     val = evaluate(model, val_loader, criterion, device, use_amp, amp_dtype)
                     last_val = val
                     print(f"step={global_step} fixed_val_loss={val['loss']:.4f} {val['families']}")
-                    maybe_run_debug_decode(model, val_ds, codec, cfg, global_step, device)
-                    if val["loss"] < best_val:
-                        best_val = val["loss"]
+                    debug_metrics = maybe_run_debug_decode(model, val_ds, codec, cfg, global_step, device)
+                    if _should_save_best(cfg, val, debug_metrics, best_val, best_score):
+                        selection_score = _selection_score(cfg, val, debug_metrics)
+                        best_val = min(best_val, val["loss"])
+                        best_score = max(best_score, selection_score)
                         save_checkpoint(
                             out_dir / "best.pt",
                             model,
@@ -197,8 +203,11 @@ def main() -> None:
                             scheduler,
                             scaler,
                             global_step,
-                            best_val,
+                            val["loss"],
                             cfg,
+                            debug_metrics=debug_metrics,
+                            selection_metric=cfg.get("checkpoint_metric", "fixed_val_loss"),
+                            selection_score=selection_score,
                         )
                 if rank == 0 and global_step % int(cfg.get("save_interval", 1000)) == 0:
                     save_checkpoint(
@@ -219,6 +228,7 @@ def main() -> None:
     if rank == 0:
         val = evaluate(model, val_loader, criterion, device, use_amp, amp_dtype)
         print(f"step={global_step} final_fixed_val_loss={val['loss']:.4f} {val['families']}")
+        debug_metrics = maybe_run_debug_decode(model, val_ds, codec, cfg, global_step, device)
         save_checkpoint(
             out_dir / "last.pt",
             model,
@@ -230,8 +240,11 @@ def main() -> None:
             global_step,
             val["loss"],
             cfg,
+            debug_metrics=debug_metrics,
+            selection_metric=cfg.get("checkpoint_metric", "fixed_val_loss"),
+            selection_score=_selection_score(cfg, val, debug_metrics),
         )
-        if val["loss"] < best_val:
+        if _should_save_best(cfg, val, debug_metrics, best_val, best_score):
             save_checkpoint(
                 out_dir / "best.pt",
                 model,
@@ -243,6 +256,9 @@ def main() -> None:
                 global_step,
                 val["loss"],
                 cfg,
+                debug_metrics=debug_metrics,
+                selection_metric=cfg.get("checkpoint_metric", "fixed_val_loss"),
+                selection_score=_selection_score(cfg, val, debug_metrics),
             )
     if is_ddp:
         dist.destroy_process_group()
@@ -287,10 +303,10 @@ def maybe_run_debug_decode(
     cfg: dict[str, Any],
     global_step: int,
     device: torch.device,
-) -> None:
+) -> dict[str, Any] | None:
     debug_cfg = cfg.get("debug_decode", {})
     if not debug_cfg or not debug_cfg.get("enabled", False):
-        return
+        return None
 
     module = model.module if hasattr(model, "module") else model
     max_items = min(int(debug_cfg.get("max_items", 2)), len(dataset))
@@ -325,6 +341,8 @@ def maybe_run_debug_decode(
             eos_bias_after_token_ratio=debug_cfg.get("eos_bias_after_token_ratio"),
             force_eos_on_loop=bool(debug_cfg.get("force_eos_on_loop", False)),
             max_tokens_since_shift=debug_cfg.get("max_tokens_since_shift"),
+            max_same_time_events=debug_cfg.get("max_same_time_events"),
+            max_same_time_note_ons=debug_cfg.get("max_same_time_note_ons"),
             return_stats=True,
         )
         decoded = codec.decode(tokens, stop_reason=stats.stop_reason)
@@ -343,6 +361,9 @@ def maybe_run_debug_decode(
             "ref_notes": len(ref_notes),
             "note_f1": metric["note_f1"],
             "offset_f1": metric["offset_f1"],
+            "invalid_rate": invalid_rate,
+            "decode_s": stats.wall_time,
+            "tokens_per_second": stats.tokens_per_second,
         }
         items.append(item)
         print(
@@ -357,7 +378,7 @@ def maybe_run_debug_decode(
     module.train()
 
     if not items:
-        return
+        return None
     eos_rate = sum(x["eos"] for x in items) / len(items)
     loop_rate = sum(x["loop"] for x in items) / len(items)
     note_f1 = sum(x["note_f1"] for x in items) / len(items)
@@ -365,12 +386,74 @@ def maybe_run_debug_decode(
     pred_notes = sum(x["pred_notes"] for x in items)
     ref_notes = sum(x["ref_notes"] for x in items)
     pred_ref_ratio = pred_notes / max(1, ref_notes)
+    invalid_rate = sum(x["invalid_rate"] for x in items) / len(items)
+    avg_decode_s = sum(x["decode_s"] for x in items) / len(items)
+    avg_tok_s = sum(x["tokens_per_second"] for x in items) / len(items)
+    summary = {
+        "eos_hit_rate": eos_rate,
+        "loop_rate": loop_rate,
+        "pred_ref_ratio": pred_ref_ratio,
+        "note_f1": note_f1,
+        "offset_f1": offset_f1,
+        "pred_notes": pred_notes,
+        "ref_notes": ref_notes,
+        "invalid_event_rate": invalid_rate,
+        "avg_decode_s": avg_decode_s,
+        "avg_tokens_per_second": avg_tok_s,
+        "items": items,
+    }
     print(
         "debug_decode_summary "
         f"step={global_step} eos_hit_rate={eos_rate:.3f} loop_rate={loop_rate:.3f} "
         f"pred_ref_ratio={pred_ref_ratio:.3f} note_f1={note_f1:.4f} "
-        f"offset_f1={offset_f1:.4f} pred_notes={pred_notes} ref_notes={ref_notes}"
+        f"offset_f1={offset_f1:.4f} pred_notes={pred_notes} ref_notes={ref_notes} "
+        f"invalid={invalid_rate:.4f} tok_s={avg_tok_s:.2f}"
     )
+    return summary
+
+
+def _selection_score(
+    cfg: dict[str, Any],
+    val: dict[str, Any],
+    debug_metrics: dict[str, Any] | None,
+) -> float:
+    metric = cfg.get("checkpoint_metric", "fixed_val_loss")
+    if metric != "debug_score":
+        return -float(val["loss"])
+    if not debug_metrics:
+        return -math.inf
+    weights = cfg.get("debug_score_weights", {})
+    note_w = float(weights.get("note_f1", 1.0))
+    offset_w = float(weights.get("offset_f1", 0.25))
+    eos_w = float(weights.get("eos_hit_rate", 0.10))
+    loop_penalty = float(weights.get("loop_rate", 0.20))
+    pred_ref_penalty = float(weights.get("pred_ref_penalty", 0.05))
+    invalid_penalty = float(weights.get("invalid_event_rate", 0.05))
+    pred_ref_ratio = float(debug_metrics.get("pred_ref_ratio", 0.0))
+    ratio_error = min(abs(pred_ref_ratio - 1.0), 2.0)
+    return (
+        note_w * float(debug_metrics.get("note_f1", 0.0))
+        + offset_w * float(debug_metrics.get("offset_f1", 0.0))
+        + eos_w * float(debug_metrics.get("eos_hit_rate", 0.0))
+        - loop_penalty * float(debug_metrics.get("loop_rate", 1.0))
+        - pred_ref_penalty * ratio_error
+        - invalid_penalty * float(debug_metrics.get("invalid_event_rate", 1.0))
+    )
+
+
+def _should_save_best(
+    cfg: dict[str, Any],
+    val: dict[str, Any],
+    debug_metrics: dict[str, Any] | None,
+    best_val: float,
+    best_score: float,
+) -> bool:
+    metric = cfg.get("checkpoint_metric", "fixed_val_loss")
+    if metric == "debug_score":
+        score = _selection_score(cfg, val, debug_metrics)
+        print(f"checkpoint_selection metric=debug_score score={score:.5f} best={best_score:.5f}")
+        return score > best_score
+    return float(val["loss"]) < best_val
 
 
 def _note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dict[str, float]:
@@ -434,6 +517,9 @@ def save_checkpoint(
     step: int,
     val_loss: float | None,
     train_cfg: dict,
+    debug_metrics: dict[str, Any] | None = None,
+    selection_metric: str = "fixed_val_loss",
+    selection_score: float | None = None,
 ) -> None:
     module = model.module if hasattr(model, "module") else model
     torch.save(
@@ -451,6 +537,9 @@ def save_checkpoint(
             "scaler": scaler.state_dict(),
             "step": step,
             "val_loss": val_loss,
+            "debug_metrics": debug_metrics,
+            "selection_metric": selection_metric,
+            "selection_score": selection_score,
             "train_config": train_cfg,
         },
         path,
@@ -458,7 +547,7 @@ def save_checkpoint(
     print(f"saved {path}")
 
 
-def load_training_state(path, model, optimizer, scheduler, scaler, device, rank: int) -> tuple[int, float]:
+def load_training_state(path, model, optimizer, scheduler, scaler, device, rank: int) -> tuple[int, float, float]:
     ckpt = torch.load(path, map_location=device)
     module = model.module if hasattr(model, "module") else model
     module.load_state_dict(ckpt["model"])
@@ -468,7 +557,11 @@ def load_training_state(path, model, optimizer, scheduler, scaler, device, rank:
         scaler.load_state_dict(ckpt["scaler"])
     if rank == 0:
         print(f"resumed {path} at step={ckpt.get('step', 0)}")
-    return int(ckpt.get("step", 0)), float(ckpt.get("val_loss") or math.inf)
+    return (
+        int(ckpt.get("step", 0)),
+        float(ckpt.get("val_loss") or math.inf),
+        float(ckpt.get("selection_score") if ckpt.get("selection_score") is not None else -math.inf),
+    )
 
 
 def _estimate_updates(cfg: dict, loader: DataLoader) -> int:
