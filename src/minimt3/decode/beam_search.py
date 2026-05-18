@@ -38,6 +38,10 @@ def greedy_decode(
     max_tokens_since_shift: int | None = None,
     max_same_time_events: int | None = None,
     max_same_time_note_ons: int | None = None,
+    max_note_on_rate: float | None = None,
+    note_on_budget_floor: int = 0,
+    note_on_logit_bias: float = 0.0,
+    positive_velocity_logit_bias: float = 0.0,
     prefix_tokens: list[int] | None = None,
     return_stats: bool = False,
 ) -> list[int] | tuple[list[int], DecodeStats]:
@@ -73,7 +77,16 @@ def greedy_decode(
                 min_time_for_eos=min_time_for_eos,
                 max_same_time_events=max_same_time_events,
                 max_same_time_note_ons=max_same_time_note_ons,
+                max_note_on_rate=max_note_on_rate,
+                note_on_budget_floor=note_on_budget_floor,
             )
+        logits = _apply_note_on_bias(
+            logits,
+            codec,
+            state,
+            note_on_logit_bias=note_on_logit_bias,
+            positive_velocity_logit_bias=positive_velocity_logit_bias,
+        )
         logits = _apply_eos_bias(
             logits,
             codec,
@@ -139,6 +152,30 @@ def greedy_decode(
     stats.wall_time = time.perf_counter() - started
     stats.tokens_per_second = (len(tokens) - 1) / max(stats.wall_time, 1e-6)
     return (tokens, stats) if return_stats else tokens
+
+
+def _apply_note_on_bias(
+    logits: torch.Tensor,
+    codec: EventCodec,
+    state: ConstraintState,
+    note_on_logit_bias: float = 0.0,
+    positive_velocity_logit_bias: float = 0.0,
+) -> torch.Tensor:
+    if note_on_logit_bias == 0.0 and positive_velocity_logit_bias == 0.0:
+        return logits
+    out = logits.clone()
+    tensors = codec.constraint_tensors(logits.device)
+    active = state.active_notes or set()
+    if positive_velocity_logit_bias != 0.0 and not state.pending_velocity and not state.pending_tie:
+        velocity_ids = tensors["velocity_ids"]
+        velocity_values = tensors["velocity_values"]
+        out[velocity_ids[velocity_values > 0]] += positive_velocity_logit_bias
+    if note_on_logit_bias != 0.0 and state.current_velocity > 0:
+        pitch_ids = tensors["pitch_ids"]
+        pitch_values = tensors["pitch_values"]
+        pitch_allowed = torch.tensor([int(p) not in active for p in pitch_values.tolist()], device=logits.device)
+        out[pitch_ids[pitch_allowed]] += note_on_logit_bias
+    return out
 
 
 def _apply_eos_bias(

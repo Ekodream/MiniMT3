@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -28,6 +29,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train MiniMT3-Piano.")
     parser.add_argument("--config", default="configs/train.yaml")
     parser.add_argument("--resume", default="")
+    parser.add_argument("--init_from", default="")
     args = parser.parse_args()
     cfg = read_yaml(args.config)
     model_cfg = read_yaml(cfg["model_config"])
@@ -47,6 +49,8 @@ def main() -> None:
     codec = build_codec(model_cfg)
     audio_cfg = LogMelConfig(**model_cfg.get("audio", {}))
     include_ties = bool(cfg.get("include_ties", False))
+    aux_cfg = cfg.get("auxiliary", {})
+    aux_enabled = bool(aux_cfg.get("enabled", False))
     train_ds = MaestroDataset(
         cfg["metadata"],
         split=cfg.get("split", "train"),
@@ -57,6 +61,8 @@ def main() -> None:
         sampling=cfg.get("train_sampling", "random"),
         seed=int(cfg.get("seed", 42)) + rank,
         include_ties=include_ties,
+        aux_targets=aux_enabled,
+        onset_width_frames=int(aux_cfg.get("onset_width_frames", 1)),
     )
     val_sampling = cfg.get("val_sampling", "fixed")
     if val_sampling != "fixed":
@@ -71,6 +77,8 @@ def main() -> None:
         sampling=val_sampling,
         seed=int(cfg.get("seed", 42)),
         include_ties=include_ties,
+        aux_targets=aux_enabled,
+        onset_width_frames=int(aux_cfg.get("onset_width_frames", 1)),
     )
 
     if rank == 0:
@@ -113,9 +121,12 @@ def main() -> None:
         model = DistributedDataParallel(
             model,
             device_ids=[local_rank],
-            find_unused_parameters=False,
+            find_unused_parameters=not aux_enabled,
             gradient_as_bucket_view=True,
         )
+    init_from = args.init_from or cfg.get("init_from", "")
+    if init_from and not args.resume:
+        load_model_weights(init_from, model, device, rank)
     criterion = WeightedSeq2SeqLoss(
         codec,
         label_smoothing=float(cfg.get("label_smoothing", 0.05)),
@@ -146,6 +157,8 @@ def main() -> None:
     best_val = float("inf")
     best_score = -math.inf
     last_val: dict[str, Any] | None = None
+    last_debug: dict[str, Any] | None = None
+    bad_debug_evals = 0
     if args.resume:
         global_step, best_val, best_score = load_training_state(
             args.resume, model, optimizer, scheduler, scaler, device, rank
@@ -153,8 +166,9 @@ def main() -> None:
 
     grad_accum = int(cfg.get("grad_accum", 1))
     max_steps = int(cfg.get("max_steps") or 0)
+    stop_training = False
     for epoch in range(int(cfg.get("epochs", 5))):
-        if max_steps and global_step >= max_steps:
+        if stop_training or (max_steps and global_step >= max_steps):
             break
         train_ds.set_epoch(epoch)
         if train_sampler:
@@ -168,9 +182,16 @@ def main() -> None:
             decoder_in = tokens[:, :-1]
             target = tokens[:, 1:]
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                logits = model(features, decoder_in)
+                model_out = model(features, decoder_in, return_aux=aux_enabled)
+                logits = model_out["logits"] if aux_enabled else model_out
                 loss_out = criterion(logits, target)
-                loss = loss_out.loss / grad_accum
+                total_loss = loss_out.loss
+                if aux_enabled:
+                    aux_loss, aux_logs = auxiliary_loss(model_out, batch, device, aux_cfg)
+                    total_loss = total_loss + aux_loss
+                    for key, value in aux_logs.items():
+                        loss_out.family_losses[key] = value
+                loss = total_loss / grad_accum
             scaler.scale(loss).backward()
             if (micro_step + 1) % grad_accum == 0:
                 scaler.unscale_(optimizer)
@@ -183,32 +204,50 @@ def main() -> None:
                 if rank == 0 and global_step % int(cfg.get("log_interval", 20)) == 0:
                     lr = scheduler.get_last_lr()[0]
                     fam = " ".join(f"{k}:{v:.3f}" for k, v in loss_out.family_losses.items())
-                    iterator.set_postfix(loss=f"{loss_out.loss.item():.4f}", lr=f"{lr:.2e}")
-                    print(f"step={global_step} train_loss={loss_out.loss.item():.4f} lr={lr:.3e} {fam}")
-                if rank == 0 and global_step % int(cfg.get("eval_interval", 500)) == 0:
-                    val = evaluate(model, val_loader, criterion, device, use_amp, amp_dtype)
-                    last_val = val
-                    print(f"step={global_step} fixed_val_loss={val['loss']:.4f} {val['families']}")
-                    debug_metrics = maybe_run_debug_decode(model, val_ds, codec, cfg, global_step, device)
-                    if _should_save_best(cfg, val, debug_metrics, best_val, best_score):
-                        selection_score = _selection_score(cfg, val, debug_metrics)
-                        best_val = min(best_val, val["loss"])
-                        best_score = max(best_score, selection_score)
-                        save_checkpoint(
-                            out_dir / "best.pt",
-                            model,
-                            model_cfg,
-                            codec,
-                            optimizer,
-                            scheduler,
-                            scaler,
-                            global_step,
-                            val["loss"],
-                            cfg,
-                            debug_metrics=debug_metrics,
-                            selection_metric=cfg.get("checkpoint_metric", "fixed_val_loss"),
-                            selection_score=selection_score,
-                        )
+                    iterator.set_postfix(loss=f"{total_loss.item():.4f}", lr=f"{lr:.2e}")
+                    print(f"step={global_step} train_loss={total_loss.item():.4f} lr={lr:.3e} {fam}")
+                if global_step % int(cfg.get("eval_interval", 500)) == 0:
+                    stop_now = False
+                    if rank == 0:
+                        val = evaluate(model, val_loader, criterion, device, use_amp, amp_dtype, aux_cfg)
+                        last_val = val
+                        print(f"step={global_step} fixed_val_loss={val['loss']:.4f} {val['families']}")
+                        debug_metrics = maybe_run_debug_decode(model, val_ds, codec, cfg, global_step, device)
+                        last_debug = debug_metrics
+                        if _should_save_best(cfg, val, debug_metrics, best_val, best_score):
+                            selection_score = _selection_score(cfg, val, debug_metrics)
+                            best_val = min(best_val, val["loss"])
+                            best_score = max(best_score, selection_score)
+                            save_checkpoint(
+                                out_dir / "best.pt",
+                                model,
+                                model_cfg,
+                                codec,
+                                optimizer,
+                                scheduler,
+                                scaler,
+                                global_step,
+                                val["loss"],
+                                cfg,
+                                debug_metrics=debug_metrics,
+                                selection_metric=cfg.get("checkpoint_metric", "fixed_val_loss"),
+                                selection_score=selection_score,
+                            )
+                        if _is_bad_debug_eval(cfg, debug_metrics, global_step):
+                            bad_debug_evals += 1
+                            print(
+                                f"debug_guard bad_eval_count={bad_debug_evals} "
+                                f"patience={cfg.get('early_stop', {}).get('patience', 0)}"
+                            )
+                        else:
+                            bad_debug_evals = 0
+                        stop_now = _should_early_stop(cfg, bad_debug_evals)
+                    if not is_ddp:
+                        stop_training = stop_now
+                    if stop_training:
+                        if rank == 0:
+                            print(f"early_stop triggered at step={global_step}")
+                        break
                 if rank == 0 and global_step % int(cfg.get("save_interval", 1000)) == 0:
                     save_checkpoint(
                         out_dir / f"step_{global_step}.pt",
@@ -224,11 +263,18 @@ def main() -> None:
                     )
                 if max_steps and global_step >= max_steps:
                     break
+        if stop_training:
+            break
 
     if rank == 0:
-        val = evaluate(model, val_loader, criterion, device, use_amp, amp_dtype)
-        print(f"step={global_step} final_fixed_val_loss={val['loss']:.4f} {val['families']}")
-        debug_metrics = maybe_run_debug_decode(model, val_ds, codec, cfg, global_step, device)
+        if is_ddp and last_val is not None:
+            val = last_val
+            debug_metrics = last_debug
+            print(f"step={global_step} final_reuse_fixed_val_loss={val['loss']:.4f} {val['families']}")
+        else:
+            val = evaluate(model, val_loader, criterion, device, use_amp, amp_dtype, aux_cfg)
+            print(f"step={global_step} final_fixed_val_loss={val['loss']:.4f} {val['families']}")
+            debug_metrics = maybe_run_debug_decode(model, val_ds, codec, cfg, global_step, device)
         save_checkpoint(
             out_dir / "last.pt",
             model,
@@ -244,7 +290,7 @@ def main() -> None:
             selection_metric=cfg.get("checkpoint_metric", "fixed_val_loss"),
             selection_score=_selection_score(cfg, val, debug_metrics),
         )
-        if _should_save_best(cfg, val, debug_metrics, best_val, best_score):
+        if (not is_ddp or last_val is None) and _should_save_best(cfg, val, debug_metrics, best_val, best_score):
             save_checkpoint(
                 out_dir / "best.pt",
                 model,
@@ -265,23 +311,92 @@ def main() -> None:
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, use_amp: bool, amp_dtype: torch.dtype) -> dict[str, Any]:
+def evaluate(
+    model,
+    loader,
+    criterion,
+    device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    aux_cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     model.eval()
     losses = []
     family_accum: dict[str, list[float]] = {}
+    aux_enabled = bool(aux_cfg and aux_cfg.get("enabled", False))
     for batch in loader:
         features = batch["features"].to(device, non_blocking=True)
         tokens = batch["tokens"].to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits = model(features, tokens[:, :-1])
+            model_out = model(features, tokens[:, :-1], return_aux=aux_enabled)
+            logits = model_out["logits"] if aux_enabled else model_out
             loss_out = criterion(logits, tokens[:, 1:])
-        losses.append(float(loss_out.loss.item()))
+            total_loss = loss_out.loss
+            if aux_enabled:
+                aux_loss, aux_logs = auxiliary_loss(model_out, batch, device, aux_cfg or {})
+                total_loss = total_loss + aux_loss
+                for key, value in aux_logs.items():
+                    loss_out.family_losses[key] = value
+        losses.append(float(total_loss.item()))
         for key, value in loss_out.family_losses.items():
             family_accum.setdefault(key, []).append(value)
     model.train()
     return {
         "loss": sum(losses) / max(1, len(losses)),
         "families": {k: sum(v) / len(v) for k, v in family_accum.items()},
+    }
+
+
+def auxiliary_loss(
+    model_out: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    device: torch.device,
+    aux_cfg: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    onset_logits = model_out["onset_logits"]
+    frame_logits = model_out["frame_logits"]
+    onset_target = batch["onset_targets"].to(device, non_blocking=True)
+    frame_target = batch["frame_targets"].to(device, non_blocking=True)
+    mask = batch["aux_mask"].to(device, non_blocking=True).unsqueeze(-1).float()
+
+    max_len = min(onset_logits.shape[1], onset_target.shape[1])
+    onset_logits = onset_logits[:, :max_len]
+    frame_logits = frame_logits[:, :max_len]
+    onset_target = onset_target[:, :max_len]
+    frame_target = frame_target[:, :max_len]
+    mask = mask[:, :max_len]
+
+    onset_pos_weight = torch.full(
+        (onset_logits.shape[-1],),
+        float(aux_cfg.get("onset_pos_weight", 18.0)),
+        device=device,
+    )
+    frame_pos_weight = torch.full(
+        (frame_logits.shape[-1],),
+        float(aux_cfg.get("frame_pos_weight", 4.0)),
+        device=device,
+    )
+    onset_raw = F.binary_cross_entropy_with_logits(
+        onset_logits,
+        onset_target,
+        reduction="none",
+        pos_weight=onset_pos_weight,
+    )
+    frame_raw = F.binary_cross_entropy_with_logits(
+        frame_logits,
+        frame_target,
+        reduction="none",
+        pos_weight=frame_pos_weight,
+    )
+    denom = (mask.sum() * onset_logits.shape[-1]).clamp_min(1.0)
+    onset_loss = (onset_raw * mask).sum() / denom
+    frame_loss = (frame_raw * mask).sum() / denom
+    weighted = float(aux_cfg.get("onset_weight", 0.15)) * onset_loss + float(
+        aux_cfg.get("frame_weight", 0.05)
+    ) * frame_loss
+    return weighted, {
+        "ONSET_AUX": float(onset_loss.detach().cpu()),
+        "FRAME_AUX": float(frame_loss.detach().cpu()),
     }
 
 
@@ -343,6 +458,10 @@ def maybe_run_debug_decode(
             max_tokens_since_shift=debug_cfg.get("max_tokens_since_shift"),
             max_same_time_events=debug_cfg.get("max_same_time_events"),
             max_same_time_note_ons=debug_cfg.get("max_same_time_note_ons"),
+            max_note_on_rate=debug_cfg.get("max_note_on_rate"),
+            note_on_budget_floor=int(debug_cfg.get("note_on_budget_floor", 0)),
+            note_on_logit_bias=float(debug_cfg.get("note_on_logit_bias", 0.0)),
+            positive_velocity_logit_bias=float(debug_cfg.get("positive_velocity_logit_bias", 0.0)),
             return_stats=True,
         )
         decoded = codec.decode(tokens, stop_reason=stats.stop_reason)
@@ -353,9 +472,13 @@ def maybe_run_debug_decode(
         )
         metric = _note_metrics(decoded.notes, ref_notes)
         invalid_rate = decoded.invalid_events / max(1, decoded.total_events)
-        is_loop = "loop" in stats.stop_reason
+        natural_eos = decoded.eos_hit and stats.stop_reason == "eos"
+        forced_eos = "forced_eos" in stats.stop_reason
+        is_loop = _is_loop_stop(stats.stop_reason)
         item = {
             "eos": float(decoded.eos_hit),
+            "natural_eos": float(natural_eos),
+            "forced_eos": float(forced_eos),
             "loop": float(is_loop),
             "pred_notes": len(decoded.notes),
             "ref_notes": len(ref_notes),
@@ -364,6 +487,7 @@ def maybe_run_debug_decode(
             "invalid_rate": invalid_rate,
             "decode_s": stats.wall_time,
             "tokens_per_second": stats.tokens_per_second,
+            "stop_reason": stats.stop_reason,
         }
         items.append(item)
         print(
@@ -380,6 +504,8 @@ def maybe_run_debug_decode(
     if not items:
         return None
     eos_rate = sum(x["eos"] for x in items) / len(items)
+    natural_eos_rate = sum(x["natural_eos"] for x in items) / len(items)
+    forced_eos_rate = sum(x["forced_eos"] for x in items) / len(items)
     loop_rate = sum(x["loop"] for x in items) / len(items)
     note_f1 = sum(x["note_f1"] for x in items) / len(items)
     offset_f1 = sum(x["offset_f1"] for x in items) / len(items)
@@ -389,8 +515,14 @@ def maybe_run_debug_decode(
     invalid_rate = sum(x["invalid_rate"] for x in items) / len(items)
     avg_decode_s = sum(x["decode_s"] for x in items) / len(items)
     avg_tok_s = sum(x["tokens_per_second"] for x in items) / len(items)
+    stop_counts: dict[str, int] = {}
+    for item in items:
+        reason = str(item["stop_reason"])
+        stop_counts[reason] = stop_counts.get(reason, 0) + 1
     summary = {
         "eos_hit_rate": eos_rate,
+        "natural_eos_rate": natural_eos_rate,
+        "forced_eos_rate": forced_eos_rate,
         "loop_rate": loop_rate,
         "pred_ref_ratio": pred_ref_ratio,
         "note_f1": note_f1,
@@ -400,14 +532,16 @@ def maybe_run_debug_decode(
         "invalid_event_rate": invalid_rate,
         "avg_decode_s": avg_decode_s,
         "avg_tokens_per_second": avg_tok_s,
+        "stop_reason_counts": stop_counts,
         "items": items,
     }
     print(
         "debug_decode_summary "
-        f"step={global_step} eos_hit_rate={eos_rate:.3f} loop_rate={loop_rate:.3f} "
+        f"step={global_step} eos_hit_rate={eos_rate:.3f} natural_eos_rate={natural_eos_rate:.3f} "
+        f"forced_eos_rate={forced_eos_rate:.3f} loop_rate={loop_rate:.3f} "
         f"pred_ref_ratio={pred_ref_ratio:.3f} note_f1={note_f1:.4f} "
         f"offset_f1={offset_f1:.4f} pred_notes={pred_notes} ref_notes={ref_notes} "
-        f"invalid={invalid_rate:.4f} tok_s={avg_tok_s:.2f}"
+        f"invalid={invalid_rate:.4f} tok_s={avg_tok_s:.2f} stops={stop_counts}"
     )
     return summary
 
@@ -426,7 +560,9 @@ def _selection_score(
     note_w = float(weights.get("note_f1", 1.0))
     offset_w = float(weights.get("offset_f1", 0.25))
     eos_w = float(weights.get("eos_hit_rate", 0.10))
+    natural_eos_w = float(weights.get("natural_eos_rate", 0.0))
     loop_penalty = float(weights.get("loop_rate", 0.20))
+    forced_eos_penalty = float(weights.get("forced_eos_rate", 0.0))
     pred_ref_penalty = float(weights.get("pred_ref_penalty", 0.05))
     invalid_penalty = float(weights.get("invalid_event_rate", 0.05))
     pred_ref_ratio = float(debug_metrics.get("pred_ref_ratio", 0.0))
@@ -435,7 +571,9 @@ def _selection_score(
         note_w * float(debug_metrics.get("note_f1", 0.0))
         + offset_w * float(debug_metrics.get("offset_f1", 0.0))
         + eos_w * float(debug_metrics.get("eos_hit_rate", 0.0))
+        + natural_eos_w * float(debug_metrics.get("natural_eos_rate", 0.0))
         - loop_penalty * float(debug_metrics.get("loop_rate", 1.0))
+        - forced_eos_penalty * float(debug_metrics.get("forced_eos_rate", 0.0))
         - pred_ref_penalty * ratio_error
         - invalid_penalty * float(debug_metrics.get("invalid_event_rate", 1.0))
     )
@@ -454,6 +592,48 @@ def _should_save_best(
         print(f"checkpoint_selection metric=debug_score score={score:.5f} best={best_score:.5f}")
         return score > best_score
     return float(val["loss"]) < best_val
+
+
+def _is_loop_stop(stop_reason: str) -> bool:
+    loop_markers = ("loop", "too_many_tokens_without_shift", "no_shift")
+    return any(marker in stop_reason for marker in loop_markers)
+
+
+def _is_bad_debug_eval(
+    cfg: dict[str, Any],
+    debug_metrics: dict[str, Any] | None,
+    global_step: int,
+) -> bool:
+    early_cfg = cfg.get("early_stop", {})
+    if not early_cfg or not early_cfg.get("enabled", False) or debug_metrics is None:
+        return False
+    if global_step < int(early_cfg.get("min_steps", 0)):
+        return False
+
+    loop_rate = float(debug_metrics.get("loop_rate", 1.0))
+    natural_eos_rate = float(debug_metrics.get("natural_eos_rate", debug_metrics.get("eos_hit_rate", 0.0)))
+    pred_ref_ratio = float(debug_metrics.get("pred_ref_ratio", 0.0))
+    note_f1 = float(debug_metrics.get("note_f1", 0.0))
+
+    if loop_rate > float(early_cfg.get("max_loop_rate", 1.0)):
+        return True
+    if natural_eos_rate < float(early_cfg.get("min_natural_eos_rate", 0.0)):
+        return True
+    if pred_ref_ratio < float(early_cfg.get("min_pred_ref_ratio", 0.0)):
+        return True
+    if pred_ref_ratio > float(early_cfg.get("max_pred_ref_ratio", 999.0)):
+        return True
+    min_note_f1 = early_cfg.get("min_note_f1")
+    if min_note_f1 is not None and note_f1 < float(min_note_f1):
+        return True
+    return False
+
+
+def _should_early_stop(cfg: dict[str, Any], bad_debug_evals: int) -> bool:
+    early_cfg = cfg.get("early_stop", {})
+    if not early_cfg or not early_cfg.get("enabled", False):
+        return False
+    return bad_debug_evals >= int(early_cfg.get("patience", 2))
 
 
 def _note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dict[str, float]:
@@ -545,6 +725,18 @@ def save_checkpoint(
         path,
     )
     print(f"saved {path}")
+
+
+def load_model_weights(path, model, device, rank: int) -> None:
+    ckpt = torch.load(path, map_location=device)
+    module = model.module if hasattr(model, "module") else model
+    incompatible = module.load_state_dict(ckpt["model"], strict=False)
+    if rank == 0:
+        print(f"initialized model weights from {path} at source_step={ckpt.get('step', 'unknown')}")
+        if incompatible.missing_keys:
+            print(f"init_missing_keys={incompatible.missing_keys}")
+        if incompatible.unexpected_keys:
+            print(f"init_unexpected_keys={incompatible.unexpected_keys}")
 
 
 def load_training_state(path, model, optimizer, scheduler, scaler, device, rank: int) -> tuple[int, float, float]:

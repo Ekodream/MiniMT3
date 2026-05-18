@@ -1,0 +1,31 @@
+model_config: configs/model_v3_tie4.yaml
+sample_rate: 16000
+window_seconds: 4.0
+overlap_seconds: 0.75
+max_tokens: 520
+decode:
+  mode: fast_greedy
+  constrained: true
+  beam_size: 4
+  repetition_penalty: 1.35
+  loop_window: 10
+  loop_repeats: 3
+  max_time_seconds: 4.3
+  eos_bias_after_seconds: 3.1
+  eos_logit_bias: 2.5
+  eos_bias_after_token_ratio: 0.72
+  force_eos_on_loop: true
+  max_tokens_since_shift: 36
+  max_same_time_events: 28
+  max_same_time_note_ons: 10
+  carry_tie_state: true
+  max_carry_ties: 12
+cleanup:
+  pedal_aware: true
+  quantize: true
+  quantize_step: 0.125
+render:
+  write_musicxml: true
+  write_png: false
+  write_pdf: false
+  write_svg: false

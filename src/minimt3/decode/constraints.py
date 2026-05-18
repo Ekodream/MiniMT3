@@ -56,6 +56,8 @@ class ConstraintState:
         min_time_for_eos: float = 0.5,
         max_same_time_events: int | None = None,
         max_same_time_note_ons: int | None = None,
+        max_note_on_rate: float | None = None,
+        note_on_budget_floor: int = 0,
     ) -> torch.Tensor:
         mask = torch.zeros(self.codec.vocab_size, dtype=torch.bool, device=device)
         tensors = self.codec.constraint_tensors(device)
@@ -69,6 +71,7 @@ class ConstraintState:
         chord_limit_reached = (
             max_same_time_note_ons is not None and len(active) >= max_same_time_note_ons
         )
+        budget_limit_reached = self._note_on_budget_reached(max_note_on_rate, note_on_budget_floor)
 
         if self.current_time >= min_time_for_eos and not self.pending_velocity and not self.pending_tie:
             mask[self.codec.eos_id] = True
@@ -98,17 +101,18 @@ class ConstraintState:
                 velocity_ids = tensors["velocity_ids"]
                 velocity_values = tensors["velocity_values"]
                 if active:
-                    if note_on_limit_reached or chord_limit_reached:
+                    if note_on_limit_reached or chord_limit_reached or budget_limit_reached:
                         mask[velocity_ids[velocity_values == 0]] = True
                     else:
                         mask[velocity_ids] = True
-                elif not note_on_limit_reached and not chord_limit_reached:
+                elif not note_on_limit_reached and not chord_limit_reached and not budget_limit_reached:
                     mask[velocity_ids[velocity_values > 0]] = True
 
             if (
                 not event_limit_reached
                 and not note_on_limit_reached
                 and not chord_limit_reached
+                and not budget_limit_reached
                 and self.prefix_mode
                 and self.current_time <= self.codec.step_seconds / 2
                 and not self.pending_tie
@@ -121,7 +125,7 @@ class ConstraintState:
             if self.current_velocity == 0:
                 pitch_allowed = torch.tensor([int(p) in active for p in pitch_values.tolist()], device=device)
             else:
-                can_add_note = not note_on_limit_reached and not chord_limit_reached
+                can_add_note = not note_on_limit_reached and not chord_limit_reached and not budget_limit_reached
                 pitch_allowed = torch.tensor(
                     [can_add_note and int(p) not in active for p in pitch_values.tolist()],
                     device=device,
@@ -132,6 +136,7 @@ class ConstraintState:
             and not event_limit_reached
             and not note_on_limit_reached
             and not chord_limit_reached
+            and not budget_limit_reached
         ):
             pitch_allowed = torch.tensor([int(p) not in active for p in pitch_values.tolist()], device=device)
             mask[pitch_ids[pitch_allowed]] = True
@@ -206,6 +211,12 @@ class ConstraintState:
             self.tokens_since_shift += 1
             self.events_since_shift += 1
 
+    def _note_on_budget_reached(self, max_note_on_rate: float | None, budget_floor: int) -> bool:
+        if max_note_on_rate is None or max_note_on_rate <= 0:
+            return False
+        allowed = max(0, int(budget_floor)) + max(0.0, self.current_time) * max_note_on_rate
+        return self.note_on_count >= allowed
+
 
 def apply_constraints(
     logits: torch.Tensor,
@@ -213,12 +224,16 @@ def apply_constraints(
     min_time_for_eos: float = 0.5,
     max_same_time_events: int | None = None,
     max_same_time_note_ons: int | None = None,
+    max_note_on_rate: float | None = None,
+    note_on_budget_floor: int = 0,
 ) -> torch.Tensor:
     mask = state.allowed_mask(
         logits.device,
         min_time_for_eos=min_time_for_eos,
         max_same_time_events=max_same_time_events,
         max_same_time_note_ons=max_same_time_note_ons,
+        max_note_on_rate=max_note_on_rate,
+        note_on_budget_floor=note_on_budget_floor,
     )
     constrained = logits.clone()
     constrained[~mask] = -1e9

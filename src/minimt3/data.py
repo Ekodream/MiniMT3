@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import random
 from collections import Counter
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from torch.utils.data import Dataset
 
 from minimt3.audio.features import LogMelConfig, LogMelExtractor
 from minimt3.audio.preprocess import load_audio
-from minimt3.symbolic.events import EventCodec
+from minimt3.symbolic.events import EventCodec, PITCH_MAX, PITCH_MIN, NoteEvent, load_midi_events
 from minimt3.utils import read_json
 
 
@@ -105,12 +106,32 @@ class Collator:
         features = torch.zeros(len(batch), n_mels, max_frames)
         tokens = torch.full((len(batch), max_tokens), self.pad_id, dtype=torch.long)
         lengths = torch.zeros(len(batch), dtype=torch.long)
+        has_aux = "onset_targets" in batch[0] and "frame_targets" in batch[0]
+        if has_aux:
+            max_aux_frames = max(item["onset_targets"].shape[0] for item in batch)
+            onset_targets = torch.zeros(len(batch), max_aux_frames, PITCH_MAX - PITCH_MIN + 1)
+            frame_targets = torch.zeros(len(batch), max_aux_frames, PITCH_MAX - PITCH_MIN + 1)
+            aux_mask = torch.zeros(len(batch), max_aux_frames, dtype=torch.bool)
         for i, item in enumerate(batch):
             feat = item["features"].squeeze(0)
             features[i, :, : feat.shape[-1]] = feat
             tokens[i, : item["tokens"].numel()] = item["tokens"]
             lengths[i] = item["tokens"].numel()
-        return {"features": features, "tokens": tokens, "lengths": lengths}
+            if has_aux:
+                aux_len = item["onset_targets"].shape[0]
+                onset_targets[i, :aux_len] = item["onset_targets"]
+                frame_targets[i, :aux_len] = item["frame_targets"]
+                aux_mask[i, :aux_len] = True
+        out = {"features": features, "tokens": tokens, "lengths": lengths}
+        if has_aux:
+            out.update(
+                {
+                    "onset_targets": onset_targets,
+                    "frame_targets": frame_targets,
+                    "aux_mask": aux_mask,
+                }
+            )
+        return out
 
 
 class MaestroDataset(Dataset):
@@ -125,6 +146,8 @@ class MaestroDataset(Dataset):
         sampling: str = "random",
         seed: int = 42,
         include_ties: bool = False,
+        aux_targets: bool = False,
+        onset_width_frames: int = 1,
     ):
         if sampling not in {"random", "fixed"}:
             raise ValueError("sampling must be 'random' or 'fixed'")
@@ -137,6 +160,8 @@ class MaestroDataset(Dataset):
         self.feature_extractor = LogMelExtractor(feature_config)
         self.train_seconds = train_seconds
         self.include_ties = include_ties
+        self.aux_targets = aux_targets
+        self.onset_width_frames = max(0, int(onset_width_frames))
 
         if _looks_like_clip_manifest(rows):
             self.rows = [
@@ -192,7 +217,21 @@ class MaestroDataset(Dataset):
             ),
             dtype=torch.long,
         )
-        return {"features": features, "tokens": tokens}
+        out = {"features": features, "tokens": tokens}
+        if self.aux_targets:
+            duration = max(0.01, end - start)
+            aux_frames = _encoder_frame_count(features.shape[-1])
+            onset_targets, frame_targets = build_note_aux_targets(
+                row["midi"],
+                start=start,
+                end=end,
+                frames=aux_frames,
+                duration=duration,
+                onset_width_frames=self.onset_width_frames,
+            )
+            out["onset_targets"] = onset_targets
+            out["frame_targets"] = frame_targets
+        return out
 
     def get_tokens(self, index: int) -> torch.Tensor:
         row = self.rows[index]
@@ -277,3 +316,49 @@ def _rows_to_default_fixed_clips(rows: list[dict[str, Any]], clip_seconds: float
             }
         )
     return clips
+
+
+def _encoder_frame_count(feature_frames: int) -> int:
+    first = (int(feature_frames) + 1) // 2
+    return max(1, (first + 1) // 2)
+
+
+def build_note_aux_targets(
+    midi_path: str | Path,
+    start: float,
+    end: float,
+    frames: int,
+    duration: float,
+    onset_width_frames: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    notes, _, tie_notes = load_midi_events(midi_path, start=start, end=end, include_ties=True)
+    onset = torch.zeros(frames, PITCH_MAX - PITCH_MIN + 1)
+    frame = torch.zeros(frames, PITCH_MAX - PITCH_MIN + 1)
+    for note in notes:
+        _write_note_targets(note, onset, frame, duration, onset_width_frames, write_onset=True)
+    for note in tie_notes:
+        _write_note_targets(note, onset, frame, duration, onset_width_frames, write_onset=False)
+    return onset, frame
+
+
+def _write_note_targets(
+    note: NoteEvent,
+    onset: torch.Tensor,
+    frame: torch.Tensor,
+    duration: float,
+    onset_width_frames: int,
+    write_onset: bool,
+) -> None:
+    if not (PITCH_MIN <= note.pitch <= PITCH_MAX):
+        return
+    frames = onset.shape[0]
+    pitch_idx = note.pitch - PITCH_MIN
+    start_pos = max(0.0, min(1.0, note.start / max(1e-6, duration)))
+    end_pos = max(start_pos, min(1.0, note.end / max(1e-6, duration)))
+    start_idx = min(frames - 1, max(0, int(start_pos * frames)))
+    end_idx = min(frames, max(start_idx + 1, int(math.ceil(end_pos * frames))))
+    frame[start_idx:end_idx, pitch_idx] = 1.0
+    if write_onset:
+        lo = max(0, start_idx - onset_width_frames)
+        hi = min(frames, start_idx + onset_width_frames + 1)
+        onset[lo:hi, pitch_idx] = 1.0

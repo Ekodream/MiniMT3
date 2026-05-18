@@ -45,13 +45,27 @@ class MiniMT3(nn.Module):
             dropout=config.dropout,
             pad_id=config.pad_id,
         )
+        self.onset_head = nn.Linear(config.d_model, 88)
+        self.frame_head = nn.Linear(config.d_model, 88)
 
     def encode(self, features: torch.Tensor) -> torch.Tensor:
         return self.encoder(features)
 
-    def forward(self, features: torch.Tensor, decoder_input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        features: torch.Tensor,
+        decoder_input_ids: torch.Tensor,
+        return_aux: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         memory = self.encode(features)
-        return self.decoder(decoder_input_ids, memory)
+        logits = self.decoder(decoder_input_ids, memory)
+        if not return_aux:
+            return logits
+        return {
+            "logits": logits,
+            "onset_logits": self.onset_head(memory),
+            "frame_logits": self.frame_head(memory),
+        }
 
     def decode_step(
         self,

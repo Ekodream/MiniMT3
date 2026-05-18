@@ -54,7 +54,7 @@ def load_checkpoint(ckpt_path: str | Path, device: str | torch.device = "cpu") -
         model_config = {**model_config, "events": {**model_config.get("events", {}), **ckpt["codec_config"]}}
     codec = build_codec(model_config)
     model = build_model(model_config, codec)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
     model.to(device)
     model.eval()
     return model, codec, model_config
@@ -144,6 +144,10 @@ def transcribe_audio(
                     max_tokens_since_shift=decode_cfg.get("max_tokens_since_shift"),
                     max_same_time_events=decode_cfg.get("max_same_time_events"),
                     max_same_time_note_ons=decode_cfg.get("max_same_time_note_ons"),
+                    max_note_on_rate=decode_cfg.get("max_note_on_rate"),
+                    note_on_budget_floor=int(decode_cfg.get("note_on_budget_floor", 0)),
+                    note_on_logit_bias=float(decode_cfg.get("note_on_logit_bias", 0.0)),
+                    positive_velocity_logit_bias=float(decode_cfg.get("positive_velocity_logit_bias", 0.0)),
                     prefix_tokens=prefix_tokens,
                     return_stats=True,
                 )
