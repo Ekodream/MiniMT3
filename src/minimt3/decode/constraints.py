@@ -23,12 +23,15 @@ class ConstraintState:
     events_since_shift: int = 0
     note_ons_since_shift: int = 0
     note_on_count: int = 0
+    pitch_counts_since_shift: dict[int, int] | None = None
     pending_tie: bool = False
     prefix_mode: bool = True
 
     def __post_init__(self) -> None:
         if self.active_notes is None:
             self.active_notes = set()
+        if self.pitch_counts_since_shift is None:
+            self.pitch_counts_since_shift = {}
 
     def clone(self) -> "ConstraintState":
         return ConstraintState(
@@ -46,6 +49,7 @@ class ConstraintState:
             events_since_shift=self.events_since_shift,
             note_ons_since_shift=self.note_ons_since_shift,
             note_on_count=self.note_on_count,
+            pitch_counts_since_shift=dict(self.pitch_counts_since_shift or {}),
             pending_tie=self.pending_tie,
             prefix_mode=self.prefix_mode,
         )
@@ -56,6 +60,7 @@ class ConstraintState:
         min_time_for_eos: float = 0.5,
         max_same_time_events: int | None = None,
         max_same_time_note_ons: int | None = None,
+        max_same_time_pitch_repeats: int | None = None,
         max_note_on_rate: float | None = None,
         note_on_budget_floor: int = 0,
     ) -> torch.Tensor:
@@ -73,6 +78,11 @@ class ConstraintState:
         )
         budget_limit_reached = self._note_on_budget_reached(max_note_on_rate, note_on_budget_floor)
 
+        def pitch_repeat_allowed(pitch: int) -> bool:
+            if max_same_time_pitch_repeats is None or max_same_time_pitch_repeats <= 0:
+                return True
+            return (self.pitch_counts_since_shift or {}).get(int(pitch), 0) < max_same_time_pitch_repeats
+
         if self.current_time >= min_time_for_eos and not self.pending_velocity and not self.pending_tie:
             mask[self.codec.eos_id] = True
 
@@ -83,7 +93,10 @@ class ConstraintState:
                 mask[velocity_ids[velocity_values > 0]] = True
                 pitch_ids = tensors["pitch_ids"]
                 pitch_values = tensors["pitch_values"]
-                pitch_allowed = torch.tensor([int(p) not in active for p in pitch_values.tolist()], device=device)
+                pitch_allowed = torch.tensor(
+                    [int(p) not in active and pitch_repeat_allowed(int(p)) for p in pitch_values.tolist()],
+                    device=device,
+                )
                 mask[pitch_ids[pitch_allowed]] = True
             if not mask.any():
                 mask[self.codec.eos_id] = True
@@ -93,7 +106,8 @@ class ConstraintState:
             shift_ids = tensors["shift_ids"]
             if self.codec.time_mode == "absolute":
                 shift_steps = tensors["shift_steps"]
-                mask[shift_ids[shift_steps * self.codec.step_seconds >= self.current_time]] = True
+                next_times = shift_steps * self.codec.step_seconds
+                mask[shift_ids[next_times > self.current_time + 1e-9]] = True
             else:
                 mask[shift_ids] = True
 
@@ -123,11 +137,17 @@ class ConstraintState:
         pitch_values = tensors["pitch_values"]
         if self.pending_velocity:
             if self.current_velocity == 0:
-                pitch_allowed = torch.tensor([int(p) in active for p in pitch_values.tolist()], device=device)
+                pitch_allowed = torch.tensor(
+                    [int(p) in active and pitch_repeat_allowed(int(p)) for p in pitch_values.tolist()],
+                    device=device,
+                )
             else:
                 can_add_note = not note_on_limit_reached and not chord_limit_reached and not budget_limit_reached
                 pitch_allowed = torch.tensor(
-                    [can_add_note and int(p) not in active for p in pitch_values.tolist()],
+                    [
+                        can_add_note and int(p) not in active and pitch_repeat_allowed(int(p))
+                        for p in pitch_values.tolist()
+                    ],
                     device=device,
                 )
             mask[pitch_ids[pitch_allowed]] = True
@@ -138,7 +158,10 @@ class ConstraintState:
             and not chord_limit_reached
             and not budget_limit_reached
         ):
-            pitch_allowed = torch.tensor([int(p) not in active for p in pitch_values.tolist()], device=device)
+            pitch_allowed = torch.tensor(
+                [int(p) not in active and pitch_repeat_allowed(int(p)) for p in pitch_values.tolist()],
+                device=device,
+            )
             mask[pitch_ids[pitch_allowed]] = True
 
         if not self.pending_velocity and not self.pending_tie and not event_limit_reached and not self.pedal_active:
@@ -162,6 +185,7 @@ class ConstraintState:
             self.tokens_since_shift = 0
             self.events_since_shift = 0
             self.note_ons_since_shift = 0
+            self.pitch_counts_since_shift = {}
             self.prefix_mode = False
             self.pending_tie = False
         elif family == "VELOCITY":
@@ -188,6 +212,7 @@ class ConstraintState:
             else:
                 self.last_pitch = pitch
                 self.repeated_pitch_count = 1
+            self.pitch_counts_since_shift[pitch] = self.pitch_counts_since_shift.get(pitch, 0) + 1
             self.seen_content = True
             self.tokens_since_shift += 1
             self.events_since_shift += 1
@@ -224,6 +249,7 @@ def apply_constraints(
     min_time_for_eos: float = 0.5,
     max_same_time_events: int | None = None,
     max_same_time_note_ons: int | None = None,
+    max_same_time_pitch_repeats: int | None = None,
     max_note_on_rate: float | None = None,
     note_on_budget_floor: int = 0,
 ) -> torch.Tensor:
@@ -232,6 +258,7 @@ def apply_constraints(
         min_time_for_eos=min_time_for_eos,
         max_same_time_events=max_same_time_events,
         max_same_time_note_ons=max_same_time_note_ons,
+        max_same_time_pitch_repeats=max_same_time_pitch_repeats,
         max_note_on_rate=max_note_on_rate,
         note_on_budget_floor=note_on_budget_floor,
     )

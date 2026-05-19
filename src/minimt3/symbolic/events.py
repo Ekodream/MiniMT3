@@ -161,6 +161,7 @@ class EventCodec:
         end: float | None = None,
         add_special: bool = True,
         include_ties: bool = False,
+        cover_to_end: bool = False,
     ) -> list[int]:
         if include_ties:
             notes, pedals, tie_notes = load_midi_events(
@@ -172,12 +173,16 @@ class EventCodec:
         else:
             notes, pedals = load_midi_events(midi_path, start=start, end=end)
             tie_notes = []
+        segment_end = None
+        if cover_to_end and end is not None:
+            segment_end = max(0.0, float(end) - float(start))
         return self.encode_events(
             notes,
             pedals,
             add_special=add_special,
             include_ties=include_ties,
             tie_notes=tie_notes,
+            segment_end=segment_end,
         )
 
     def encode_events(
@@ -187,6 +192,7 @@ class EventCodec:
         add_special: bool = True,
         include_ties: bool = False,
         tie_notes: Iterable[NoteEvent] = (),
+        segment_end: float | None = None,
     ) -> list[int]:
         cleaned_notes = _trim_overlapping_notes(_clean_notes(notes))
         cleaned_ties = _trim_overlapping_notes(_clean_notes(tie_notes)) if include_ties else []
@@ -239,6 +245,13 @@ class EventCodec:
                 pedal_active = False
             ids.append(self.token_id(token))
             wrote_any_event = True
+        if segment_end is not None:
+            end_time = max(0.0, float(segment_end))
+            if end_time > cursor + self.step_seconds / 2:
+                if self.time_mode == "absolute":
+                    ids.extend(self._encode_time_position(end_time))
+                else:
+                    ids.extend(self._encode_time_shift(end_time - cursor))
         if add_special:
             ids.append(self.eos_id)
         return ids

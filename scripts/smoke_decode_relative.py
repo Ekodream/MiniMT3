@@ -18,13 +18,22 @@ def main() -> None:
     parser.add_argument("--manifest", default="data/cache/maestro_debug_clips_rel8.json")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--items", type=int, default=2)
+    parser.add_argument("--seconds", type=float, default=8.0)
     parser.add_argument("--max_tokens", type=int, default=900)
+    parser.add_argument("--min_time_for_eos", type=float, default=0.5)
     parser.add_argument("--max_time_seconds", type=float, default=8.5)
     parser.add_argument("--eos_bias_after_seconds", type=float)
     parser.add_argument("--eos_logit_bias", type=float, default=0.0)
     parser.add_argument("--eos_bias_after_token_ratio", type=float)
     parser.add_argument("--force_eos_on_loop", action="store_true")
     parser.add_argument("--max_tokens_since_shift", type=int)
+    parser.add_argument("--max_same_time_events", type=int)
+    parser.add_argument("--max_same_time_note_ons", type=int)
+    parser.add_argument("--max_same_time_pitch_repeats", type=int)
+    parser.add_argument("--max_note_on_rate", type=float)
+    parser.add_argument("--note_on_budget_floor", type=int, default=0)
+    parser.add_argument("--note_on_logit_bias", type=float, default=0.0)
+    parser.add_argument("--positive_velocity_logit_bias", type=float, default=0.0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--repetition_penalty", type=float, default=1.15)
     args = parser.parse_args()
@@ -36,7 +45,7 @@ def main() -> None:
         split=args.split,
         codec=codec,
         feature_config=feature_config_from_model(model_config),
-        train_seconds=8.0,
+        train_seconds=args.seconds,
         max_items=args.items,
         sampling="fixed",
     )
@@ -60,12 +69,20 @@ def main() -> None:
             max_tokens=args.max_tokens,
             constrained=True,
             repetition_penalty=args.repetition_penalty,
+            min_time_for_eos=args.min_time_for_eos,
             max_time_seconds=args.max_time_seconds,
             eos_bias_after_seconds=args.eos_bias_after_seconds,
             eos_logit_bias=args.eos_logit_bias,
             eos_bias_after_token_ratio=args.eos_bias_after_token_ratio,
             force_eos_on_loop=args.force_eos_on_loop,
             max_tokens_since_shift=args.max_tokens_since_shift,
+            max_same_time_events=args.max_same_time_events,
+            max_same_time_note_ons=args.max_same_time_note_ons,
+            max_same_time_pitch_repeats=args.max_same_time_pitch_repeats,
+            max_note_on_rate=args.max_note_on_rate,
+            note_on_budget_floor=args.note_on_budget_floor,
+            note_on_logit_bias=args.note_on_logit_bias,
+            positive_velocity_logit_bias=args.positive_velocity_logit_bias,
             return_stats=True,
         )
         decoded = codec.decode(tokens, stop_reason=stats.stop_reason)

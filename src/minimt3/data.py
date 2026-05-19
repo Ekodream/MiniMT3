@@ -148,6 +148,7 @@ class MaestroDataset(Dataset):
         include_ties: bool = False,
         aux_targets: bool = False,
         onset_width_frames: int = 1,
+        target_cover_to_end: bool = False,
     ):
         if sampling not in {"random", "fixed"}:
             raise ValueError("sampling must be 'random' or 'fixed'")
@@ -162,6 +163,7 @@ class MaestroDataset(Dataset):
         self.include_ties = include_ties
         self.aux_targets = aux_targets
         self.onset_width_frames = max(0, int(onset_width_frames))
+        self.target_cover_to_end = target_cover_to_end
 
         if _looks_like_clip_manifest(rows):
             self.rows = [
@@ -214,6 +216,7 @@ class MaestroDataset(Dataset):
                 end=end,
                 add_special=True,
                 include_ties=self.include_ties,
+                cover_to_end=self.target_cover_to_end,
             ),
             dtype=torch.long,
         )
@@ -243,6 +246,7 @@ class MaestroDataset(Dataset):
                 end=end,
                 add_special=True,
                 include_ties=self.include_ties,
+                cover_to_end=self.target_cover_to_end,
             ),
             dtype=torch.long,
         )

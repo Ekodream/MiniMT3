@@ -38,6 +38,7 @@ def greedy_decode(
     max_tokens_since_shift: int | None = None,
     max_same_time_events: int | None = None,
     max_same_time_note_ons: int | None = None,
+    max_same_time_pitch_repeats: int | None = None,
     max_note_on_rate: float | None = None,
     note_on_budget_floor: int = 0,
     note_on_logit_bias: float = 0.0,
@@ -77,6 +78,7 @@ def greedy_decode(
                 min_time_for_eos=min_time_for_eos,
                 max_same_time_events=max_same_time_events,
                 max_same_time_note_ons=max_same_time_note_ons,
+                max_same_time_pitch_repeats=max_same_time_pitch_repeats,
                 max_note_on_rate=max_note_on_rate,
                 note_on_budget_floor=note_on_budget_floor,
             )

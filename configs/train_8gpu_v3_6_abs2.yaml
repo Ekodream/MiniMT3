@@ -1,0 +1,90 @@
+seed: 47
+metadata: data/cache/maestro_index.json
+val_metadata: data/cache/maestro_val_clips_abs2.json
+output_dir: outputs/ckpt_8gpu_v3_6_abs2
+init_from: outputs/ckpt_8gpu_v3_3_tie4_precision/best.pt
+split: train
+val_split: validation
+max_items:
+val_max_items: 50
+train_seconds: 2.0
+val_seconds: 2.0
+include_ties: true
+train_sampling: random
+val_sampling: fixed
+batch_size: 24
+eval_batch_size: 8
+num_workers: 4
+epochs: 500
+max_steps: 1500
+max_target_tokens: 450
+lr: 0.00006
+min_lr: 0.000015
+weight_decay: 0.015
+betas: [0.9, 0.98]
+warmup_steps: 120
+grad_accum: 1
+grad_clip: 1.0
+precision: bf16
+label_smoothing: 0.04
+eos_aux_weight: 4.5
+family_weights:
+  SHIFT: 0.90
+  VELOCITY: 0.75
+  PITCH: 1.35
+  PEDAL: 1.05
+  TIE: 1.05
+  EOS: 4.00
+auxiliary:
+  enabled: true
+  onset_weight: 0.15
+  frame_weight: 0.04
+  onset_pos_weight: 18.0
+  frame_pos_weight: 4.0
+  onset_width_frames: 1
+allow_tf32: true
+compile: false
+prefetch_factor: 2
+log_interval: 20
+eval_interval: 150
+save_interval: 300
+checkpoint_metric: debug_score
+debug_score_weights:
+  note_f1: 9.0
+  offset_f1: 0.75
+  eos_hit_rate: 0.0
+  natural_eos_rate: 0.15
+  forced_eos_rate: 1.0
+  loop_rate: 1.0
+  pred_ref_penalty: 0.45
+  invalid_event_rate: 0.05
+early_stop:
+  enabled: true
+  min_steps: 900
+  patience: 3
+  min_natural_eos_rate: 0.80
+  max_loop_rate: 0.20
+  min_pred_ref_ratio: 0.45
+  max_pred_ref_ratio: 1.80
+  min_note_f1: 0.070
+debug_decode:
+  enabled: true
+  max_items: 8
+  max_tokens: 300
+  max_time_seconds: 2.20
+  constrained: true
+  repetition_penalty: 1.38
+  loop_window: 10
+  loop_repeats: 3
+  eos_bias_after_seconds: 1.45
+  eos_logit_bias: 2.35
+  eos_bias_after_token_ratio: 0.70
+  force_eos_on_loop: false
+  max_tokens_since_shift: 28
+  max_same_time_events: 22
+  max_same_time_note_ons: 8
+  max_note_on_rate: 12.0
+  note_on_budget_floor: 10
+  note_on_logit_bias: -0.25
+  positive_velocity_logit_bias: -0.08
+model_config: configs/model_v3_abs2.yaml

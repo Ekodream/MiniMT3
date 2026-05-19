@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import math
 import os
 from pathlib import Path
@@ -21,7 +22,7 @@ from minimt3.data import Collator, MaestroDataset, summarize_token_targets
 from minimt3.decode.beam_search import greedy_decode
 from minimt3.model.loss import WeightedSeq2SeqLoss
 from minimt3.pipeline import build_codec, build_model
-from minimt3.symbolic.events import NoteEvent, load_midi_events
+from minimt3.symbolic.events import EventCodec, NoteEvent, load_midi_events
 from minimt3.utils import ensure_dir, read_yaml, seed_everything
 
 
@@ -38,7 +39,10 @@ def main() -> None:
     is_ddp = "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if is_ddp:
-        dist.init_process_group(backend=cfg.get("dist_backend", "nccl"))
+        dist.init_process_group(
+            backend=cfg.get("dist_backend", "nccl"),
+            timeout=dt.timedelta(minutes=int(cfg.get("dist_timeout_minutes", 120))),
+        )
         torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     rank = dist.get_rank() if is_ddp else 0
@@ -63,6 +67,7 @@ def main() -> None:
         include_ties=include_ties,
         aux_targets=aux_enabled,
         onset_width_frames=int(aux_cfg.get("onset_width_frames", 1)),
+        target_cover_to_end=bool(cfg.get("target_cover_to_end", False)),
     )
     val_sampling = cfg.get("val_sampling", "fixed")
     if val_sampling != "fixed":
@@ -79,6 +84,7 @@ def main() -> None:
         include_ties=include_ties,
         aux_targets=aux_enabled,
         onset_width_frames=int(aux_cfg.get("onset_width_frames", 1)),
+        target_cover_to_end=bool(cfg.get("target_cover_to_end", False)),
     )
 
     if rank == 0:
@@ -126,7 +132,14 @@ def main() -> None:
         )
     init_from = args.init_from or cfg.get("init_from", "")
     if init_from and not args.resume:
-        load_model_weights(init_from, model, device, rank)
+        load_model_weights(
+            init_from,
+            model,
+            device,
+            rank,
+            codec=codec,
+            skip_families=set(cfg.get("init_skip_families", [])),
+        )
     criterion = WeightedSeq2SeqLoss(
         codec,
         label_smoothing=float(cfg.get("label_smoothing", 0.05)),
@@ -208,11 +221,13 @@ def main() -> None:
                     print(f"step={global_step} train_loss={total_loss.item():.4f} lr={lr:.3e} {fam}")
                 if global_step % int(cfg.get("eval_interval", 500)) == 0:
                     stop_now = False
+                    stop_tensor = torch.zeros(1, dtype=torch.int32, device=device)
                     if rank == 0:
-                        val = evaluate(model, val_loader, criterion, device, use_amp, amp_dtype, aux_cfg)
+                        eval_model = model.module if hasattr(model, "module") else model
+                        val = evaluate(eval_model, val_loader, criterion, device, use_amp, amp_dtype, aux_cfg)
                         last_val = val
                         print(f"step={global_step} fixed_val_loss={val['loss']:.4f} {val['families']}")
-                        debug_metrics = maybe_run_debug_decode(model, val_ds, codec, cfg, global_step, device)
+                        debug_metrics = maybe_run_debug_decode(eval_model, val_ds, codec, cfg, global_step, device)
                         last_debug = debug_metrics
                         if _should_save_best(cfg, val, debug_metrics, best_val, best_score):
                             selection_score = _selection_score(cfg, val, debug_metrics)
@@ -242,7 +257,11 @@ def main() -> None:
                         else:
                             bad_debug_evals = 0
                         stop_now = _should_early_stop(cfg, bad_debug_evals)
-                    if not is_ddp:
+                        stop_tensor.fill_(1 if stop_now else 0)
+                    if is_ddp:
+                        dist.broadcast(stop_tensor, src=0)
+                        stop_training = bool(stop_tensor.item())
+                    else:
                         stop_training = stop_now
                     if stop_training:
                         if rank == 0:
@@ -272,9 +291,10 @@ def main() -> None:
             debug_metrics = last_debug
             print(f"step={global_step} final_reuse_fixed_val_loss={val['loss']:.4f} {val['families']}")
         else:
-            val = evaluate(model, val_loader, criterion, device, use_amp, amp_dtype, aux_cfg)
+            eval_model = model.module if hasattr(model, "module") else model
+            val = evaluate(eval_model, val_loader, criterion, device, use_amp, amp_dtype, aux_cfg)
             print(f"step={global_step} final_fixed_val_loss={val['loss']:.4f} {val['families']}")
-            debug_metrics = maybe_run_debug_decode(model, val_ds, codec, cfg, global_step, device)
+            debug_metrics = maybe_run_debug_decode(eval_model, val_ds, codec, cfg, global_step, device)
         save_checkpoint(
             out_dir / "last.pt",
             model,
@@ -450,6 +470,7 @@ def maybe_run_debug_decode(
             repetition_penalty=repetition_penalty,
             loop_window=loop_window,
             loop_repeats=loop_repeats,
+            min_time_for_eos=float(debug_cfg.get("min_time_for_eos", 0.5)),
             max_time_seconds=max_time_seconds,
             eos_bias_after_seconds=debug_cfg.get("eos_bias_after_seconds"),
             eos_logit_bias=float(debug_cfg.get("eos_logit_bias", 0.0)),
@@ -458,6 +479,7 @@ def maybe_run_debug_decode(
             max_tokens_since_shift=debug_cfg.get("max_tokens_since_shift"),
             max_same_time_events=debug_cfg.get("max_same_time_events"),
             max_same_time_note_ons=debug_cfg.get("max_same_time_note_ons"),
+            max_same_time_pitch_repeats=debug_cfg.get("max_same_time_pitch_repeats"),
             max_note_on_rate=debug_cfg.get("max_note_on_rate"),
             note_on_budget_floor=int(debug_cfg.get("note_on_budget_floor", 0)),
             note_on_logit_bias=float(debug_cfg.get("note_on_logit_bias", 0.0)),
@@ -727,16 +749,82 @@ def save_checkpoint(
     print(f"saved {path}")
 
 
-def load_model_weights(path, model, device, rank: int) -> None:
+def load_model_weights(
+    path,
+    model,
+    device,
+    rank: int,
+    codec: EventCodec | None = None,
+    skip_families: set[str] | None = None,
+) -> None:
     ckpt = torch.load(path, map_location=device)
     module = model.module if hasattr(model, "module") else model
-    incompatible = module.load_state_dict(ckpt["model"], strict=False)
+    current = module.state_dict()
+    source_state = dict(ckpt["model"])
+    remapped = _remap_vocab_rows(
+        source_state,
+        current,
+        ckpt.get("codec_config"),
+        codec,
+        skip_families=skip_families,
+    )
+    compatible = {}
+    skipped = []
+    for key, value in remapped.items():
+        if key in current and current[key].shape == value.shape:
+            compatible[key] = value
+        else:
+            skipped.append(key)
+    incompatible = module.load_state_dict(compatible, strict=False)
     if rank == 0:
         print(f"initialized model weights from {path} at source_step={ckpt.get('step', 'unknown')}")
+        if skipped:
+            preview = skipped[:16]
+            suffix = "..." if len(skipped) > len(preview) else ""
+            print(f"init_skipped_shape_or_missing={preview}{suffix}")
         if incompatible.missing_keys:
             print(f"init_missing_keys={incompatible.missing_keys}")
         if incompatible.unexpected_keys:
             print(f"init_unexpected_keys={incompatible.unexpected_keys}")
+
+
+def _remap_vocab_rows(
+    source_state: dict[str, torch.Tensor],
+    current_state: dict[str, torch.Tensor],
+    source_codec_cfg: dict[str, Any] | None,
+    target_codec: EventCodec | None,
+    skip_families: set[str] | None = None,
+) -> dict[str, torch.Tensor]:
+    if not source_codec_cfg or target_codec is None:
+        return source_state
+    source_codec = EventCodec(**source_codec_cfg)
+    remapped = dict(source_state)
+    skip_families = {str(f).upper() for f in (skip_families or set())}
+    shared = [
+        (token, source_codec.token_to_id[token], target_id)
+        for token, target_id in target_codec.token_to_id.items()
+        if token in source_codec.token_to_id
+        and target_codec.token_family(token).upper() not in skip_families
+    ]
+    for key in ("decoder.embedding.weight", "decoder.output.weight", "decoder.output.bias"):
+        if key not in source_state or key not in current_state:
+            continue
+        src = source_state[key]
+        dst = current_state[key].clone()
+        if src.ndim != dst.ndim:
+            continue
+        if src.ndim == 2 and src.shape[1] != dst.shape[1]:
+            continue
+        if src.ndim == 1:
+            for _, src_id, dst_id in shared:
+                if src_id < src.shape[0] and dst_id < dst.shape[0]:
+                    dst[dst_id] = src[src_id]
+        else:
+            for _, src_id, dst_id in shared:
+                if src_id < src.shape[0] and dst_id < dst.shape[0]:
+                    dst[dst_id].copy_(src[src_id])
+        remapped[key] = dst
+    return remapped
 
 
 def load_training_state(path, model, optimizer, scheduler, scaler, device, rank: int) -> tuple[int, float, float]:
