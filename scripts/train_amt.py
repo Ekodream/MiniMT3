@@ -220,6 +220,9 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
             offset_threshold=float(decode_cfg.get("offset_threshold", 0.35)),
             min_note_seconds=float(decode_cfg.get("min_note_seconds", 0.04)),
             max_notes_per_second=float(decode_cfg.get("max_notes_per_second", 45.0)),
+            max_polyphony=int(decode_cfg.get("max_polyphony", 12)),
+            min_onset_gap_seconds=float(decode_cfg.get("min_onset_gap_seconds", 0.06)),
+            min_frame_at_onset=float(decode_cfg.get("min_frame_at_onset", 0.0)),
         )
         ref_notes, _ = load_midi_events(row["midi"], start=float(row["start_sec"]), end=float(row["end_sec"]))
         metric = note_metrics(notes, ref_notes)

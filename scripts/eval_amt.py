@@ -25,6 +25,10 @@ def main() -> None:
     parser.add_argument("--onset_thresholds", default="0.45,0.55,0.65,0.75")
     parser.add_argument("--frame_thresholds", default="0.30,0.40,0.50")
     parser.add_argument("--offset_thresholds", default="0.30,0.40,0.50")
+    parser.add_argument("--max_polyphony", type=int)
+    parser.add_argument("--max_notes_per_second", type=float)
+    parser.add_argument("--min_onset_gap_seconds", type=float)
+    parser.add_argument("--min_frame_at_onset", type=float)
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -47,6 +51,19 @@ def main() -> None:
         for frame_t in _floats(args.frame_thresholds)
         for offset_t in _floats(args.offset_thresholds)
     ]
+    decode_cfg = cfg.get("decode", {})
+    max_polyphony = int(args.max_polyphony or decode_cfg.get("max_polyphony", 12))
+    max_notes_per_second = float(args.max_notes_per_second or decode_cfg.get("max_notes_per_second", 45.0))
+    min_onset_gap_seconds = float(
+        args.min_onset_gap_seconds
+        if args.min_onset_gap_seconds is not None
+        else decode_cfg.get("min_onset_gap_seconds", 0.06)
+    )
+    min_frame_at_onset = float(
+        args.min_frame_at_onset
+        if args.min_frame_at_onset is not None
+        else decode_cfg.get("min_frame_at_onset", 0.0)
+    )
     totals = {combo: {"note_f1": 0.0, "offset_f1": 0.0, "pred": 0, "ref": 0} for combo in combos}
     with torch.no_grad():
         for idx in range(len(dataset)):
@@ -63,6 +80,10 @@ def main() -> None:
                     onset_threshold=combo[0],
                     frame_threshold=combo[1],
                     offset_threshold=combo[2],
+                    max_notes_per_second=max_notes_per_second,
+                    max_polyphony=max_polyphony,
+                    min_onset_gap_seconds=min_onset_gap_seconds,
+                    min_frame_at_onset=min_frame_at_onset,
                 )
                 metric = note_metrics(notes, ref_notes)
                 totals[combo]["note_f1"] += metric["note_f1"]

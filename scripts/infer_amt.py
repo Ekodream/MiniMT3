@@ -21,14 +21,34 @@ def main() -> None:
     parser.add_argument("--out", default="outputs/amt_demo")
     parser.add_argument("--window_seconds", type=float, default=2.0)
     parser.add_argument("--overlap_seconds", type=float, default=0.25)
-    parser.add_argument("--onset_threshold", type=float, default=0.45)
-    parser.add_argument("--frame_threshold", type=float, default=0.35)
-    parser.add_argument("--offset_threshold", type=float, default=0.35)
+    parser.add_argument("--onset_threshold", type=float)
+    parser.add_argument("--frame_threshold", type=float)
+    parser.add_argument("--offset_threshold", type=float)
+    parser.add_argument("--max_notes_per_second", type=float)
+    parser.add_argument("--max_polyphony", type=int)
+    parser.add_argument("--min_onset_gap_seconds", type=float)
+    parser.add_argument("--min_frame_at_onset", type=float)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.ckpt, map_location=device)
     cfg = ckpt["config"]
+    decode_cfg = cfg.get("decode", {})
+    onset_threshold = float(args.onset_threshold or decode_cfg.get("onset_threshold", 0.55))
+    frame_threshold = float(args.frame_threshold or decode_cfg.get("frame_threshold", 0.25))
+    offset_threshold = float(args.offset_threshold or decode_cfg.get("offset_threshold", 0.25))
+    max_notes_per_second = float(args.max_notes_per_second or decode_cfg.get("max_notes_per_second", 24.0))
+    max_polyphony = int(args.max_polyphony or decode_cfg.get("max_polyphony", 12))
+    min_onset_gap_seconds = float(
+        args.min_onset_gap_seconds
+        if args.min_onset_gap_seconds is not None
+        else decode_cfg.get("min_onset_gap_seconds", 0.06)
+    )
+    min_frame_at_onset = float(
+        args.min_frame_at_onset
+        if args.min_frame_at_onset is not None
+        else decode_cfg.get("min_frame_at_onset", 0.0)
+    )
     audio_cfg = LogMelConfig(**cfg.get("audio", {}))
     model = DenseAMT(DenseAMTConfig(**cfg.get("model", {}))).to(device)
     model.load_state_dict(ckpt["model"], strict=False)
@@ -56,9 +76,13 @@ def main() -> None:
             window_notes = decode_dense_notes(
                 out,
                 duration=end - start,
-                onset_threshold=args.onset_threshold,
-                frame_threshold=args.frame_threshold,
-                offset_threshold=args.offset_threshold,
+                onset_threshold=onset_threshold,
+                frame_threshold=frame_threshold,
+                offset_threshold=offset_threshold,
+                max_notes_per_second=max_notes_per_second,
+                max_polyphony=max_polyphony,
+                min_onset_gap_seconds=min_onset_gap_seconds,
+                min_frame_at_onset=min_frame_at_onset,
             )
             for note in window_notes:
                 note.start += start
@@ -69,7 +93,22 @@ def main() -> None:
     out_dir = ensure_dir(args.out)
     stem = Path(args.audio).stem
     midi_path = write_midi(out_dir / f"{stem}.mid", notes, [])
-    write_json(out_dir / f"{stem}_debug.json", {"windows": debug, "notes": len(notes)})
+    write_json(
+        out_dir / f"{stem}_debug.json",
+        {
+            "windows": debug,
+            "notes": len(notes),
+            "decode": {
+                "onset_threshold": onset_threshold,
+                "frame_threshold": frame_threshold,
+                "offset_threshold": offset_threshold,
+                "max_notes_per_second": max_notes_per_second,
+                "max_polyphony": max_polyphony,
+                "min_onset_gap_seconds": min_onset_gap_seconds,
+                "min_frame_at_onset": min_frame_at_onset,
+            },
+        },
+    )
     print(f"notes={len(notes)} midi={midi_path}")
 
 

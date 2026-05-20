@@ -86,7 +86,12 @@ class DenseAMTDataset(Dataset):
                 str(row.get("start_sec", "")),
                 str(row.get("end_sec", "")),
                 str(self.feature_config.sample_rate),
+                str(self.feature_config.n_mels),
+                str(self.feature_config.n_fft),
                 str(self.feature_config.hop_length),
+                str(self.target_config.onset_width_frames),
+                str(self.target_config.offset_width_frames),
+                str(self.target_config.min_note_seconds),
             ]
         )
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]

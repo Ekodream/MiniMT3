@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 
 from minimt3.utils import read_json, write_json
 
@@ -15,7 +16,10 @@ def main() -> None:
     parser.add_argument("--stride_seconds", type=float, default=4.0)
     parser.add_argument("--max_clips", type=int, default=0)
     parser.add_argument("--max_clips_per_piece", type=int, default=0)
+    parser.add_argument("--sampling", choices=["grid", "uniform"], default="grid")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    rng = random.Random(args.seed)
 
     rows = [
         row
@@ -29,13 +33,16 @@ def main() -> None:
     for piece_idx, row in enumerate(rows):
         duration = float(row.get("duration") or 0.0)
         max_start = max(0.0, duration - args.clip_seconds)
-        starts = []
-        current = 0.0 if max_start == 0 else min(max_start, args.clip_seconds)
-        while current <= max_start + 1e-6:
-            starts.append(current)
-            current += args.stride_seconds
-            if args.max_clips_per_piece and len(starts) >= args.max_clips_per_piece:
-                break
+        if args.sampling == "uniform" and args.max_clips_per_piece:
+            starts = sorted(round(rng.uniform(0.0, max_start), 3) for _ in range(args.max_clips_per_piece))
+        else:
+            starts = []
+            current = 0.0 if max_start == 0 else min(max_start, args.clip_seconds)
+            while current <= max_start + 1e-6:
+                starts.append(current)
+                current += args.stride_seconds
+                if args.max_clips_per_piece and len(starts) >= args.max_clips_per_piece:
+                    break
         if not starts:
             starts = [0.0]
         for clip_idx, start in enumerate(starts):
