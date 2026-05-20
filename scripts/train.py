@@ -198,7 +198,7 @@ def main() -> None:
                 model_out = model(features, decoder_in, return_aux=aux_enabled)
                 logits = model_out["logits"] if aux_enabled else model_out
                 loss_out = criterion(logits, target)
-                total_loss = loss_out.loss
+                total_loss = float(cfg.get("seq_loss_weight", 1.0)) * loss_out.loss
                 if aux_enabled:
                     aux_loss, aux_logs = auxiliary_loss(model_out, batch, device, aux_cfg)
                     total_loss = total_loss + aux_loss
@@ -224,7 +224,16 @@ def main() -> None:
                     stop_tensor = torch.zeros(1, dtype=torch.int32, device=device)
                     if rank == 0:
                         eval_model = model.module if hasattr(model, "module") else model
-                        val = evaluate(eval_model, val_loader, criterion, device, use_amp, amp_dtype, aux_cfg)
+                        val = evaluate(
+                            eval_model,
+                            val_loader,
+                            criterion,
+                            device,
+                            use_amp,
+                            amp_dtype,
+                            aux_cfg,
+                            seq_loss_weight=float(cfg.get("seq_loss_weight", 1.0)),
+                        )
                         last_val = val
                         print(f"step={global_step} fixed_val_loss={val['loss']:.4f} {val['families']}")
                         debug_metrics = maybe_run_debug_decode(eval_model, val_ds, codec, cfg, global_step, device)
@@ -292,7 +301,16 @@ def main() -> None:
             print(f"step={global_step} final_reuse_fixed_val_loss={val['loss']:.4f} {val['families']}")
         else:
             eval_model = model.module if hasattr(model, "module") else model
-            val = evaluate(eval_model, val_loader, criterion, device, use_amp, amp_dtype, aux_cfg)
+            val = evaluate(
+                eval_model,
+                val_loader,
+                criterion,
+                device,
+                use_amp,
+                amp_dtype,
+                aux_cfg,
+                seq_loss_weight=float(cfg.get("seq_loss_weight", 1.0)),
+            )
             print(f"step={global_step} final_fixed_val_loss={val['loss']:.4f} {val['families']}")
             debug_metrics = maybe_run_debug_decode(eval_model, val_ds, codec, cfg, global_step, device)
         save_checkpoint(
@@ -339,6 +357,7 @@ def evaluate(
     use_amp: bool,
     amp_dtype: torch.dtype,
     aux_cfg: dict[str, Any] | None = None,
+    seq_loss_weight: float = 1.0,
 ) -> dict[str, Any]:
     model.eval()
     losses = []
@@ -351,7 +370,7 @@ def evaluate(
             model_out = model(features, tokens[:, :-1], return_aux=aux_enabled)
             logits = model_out["logits"] if aux_enabled else model_out
             loss_out = criterion(logits, tokens[:, 1:])
-            total_loss = loss_out.loss
+            total_loss = float(seq_loss_weight) * loss_out.loss
             if aux_enabled:
                 aux_loss, aux_logs = auxiliary_loss(model_out, batch, device, aux_cfg or {})
                 total_loss = total_loss + aux_loss

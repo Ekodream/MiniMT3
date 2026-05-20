@@ -1,0 +1,78 @@
+seed: 60
+metadata: data/cache/maestro_index.json
+val_metadata: data/cache/maestro_val_clips_abs2.json
+output_dir: outputs/ckpt_smoke_v4_aux_primary
+init_from: outputs/ckpt_8gpu_v3_11_abs2_indexed/best.pt
+split: train
+val_split: validation
+max_items: 256
+val_max_items: 8
+train_seconds: 2.0
+val_seconds: 2.0
+include_ties: true
+target_cover_to_end: true
+train_sampling: random
+val_sampling: fixed
+batch_size: 64
+eval_batch_size: 8
+num_workers: 2
+epochs: 2
+max_steps: 2
+max_target_tokens: 520
+seq_loss_weight: 0.25
+lr: 0.00005
+min_lr: 0.000012
+weight_decay: 0.015
+betas: [0.9, 0.98]
+warmup_steps: 1
+grad_accum: 1
+grad_clip: 1.0
+precision: bf16
+label_smoothing: 0.04
+eos_aux_weight: 0.8
+family_weights:
+  SHIFT: 0.80
+  VELOCITY: 0.70
+  PITCH: 1.20
+  PEDAL: 0.90
+  TIE: 1.00
+  EOS: 1.20
+auxiliary:
+  enabled: true
+  onset_weight: 1.00
+  frame_weight: 0.45
+  onset_pos_weight: 10.0
+  frame_pos_weight: 2.5
+  onset_width_frames: 1
+allow_tf32: true
+compile: false
+dist_timeout_minutes: 120
+prefetch_factor: 2
+log_interval: 1
+eval_interval: 2
+save_interval: 1000
+checkpoint_metric: fixed_val_loss
+early_stop:
+  enabled: false
+debug_decode:
+  enabled: true
+  max_items: 2
+  max_tokens: 520
+  max_time_seconds: 2.25
+  min_time_for_eos: 1.75
+  constrained: true
+  repetition_penalty: 1.18
+  loop_window: 12
+  loop_repeats: 3
+  eos_bias_after_seconds: 2.05
+  eos_logit_bias: 0.50
+  eos_bias_after_token_ratio: 0.90
+  force_eos_on_loop: false
+  max_tokens_since_shift: 44
+  max_same_time_events: 36
+  max_same_time_note_ons: 12
+  max_note_on_rate: 26.0
+  note_on_budget_floor: 34
+  note_on_logit_bias: 0.25
+  positive_velocity_logit_bias: 0.20
+model_config: configs/model_v3_abs2.yaml
