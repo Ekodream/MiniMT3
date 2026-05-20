@@ -1,0 +1,65 @@
+seed: 70
+train_manifest: data/cache/amt_train_2s_s4.json
+val_manifest: data/cache/amt_val_2s_s4.json
+train_split: train
+val_split: validation
+output_dir: outputs/ckpt_amt_v5
+init_from: outputs/ckpt_8gpu_v3_11_abs2_indexed/best.pt
+train_cache_dir: data/cache/amt_v5_train
+val_cache_dir: data/cache/amt_v5_val
+max_items:
+val_max_items: 50
+batch_size: 64
+eval_batch_size: 16
+num_workers: 4
+eval_workers: 2
+epochs: 500
+max_steps: 1200
+lr: 0.00008
+min_lr: 0.000015
+warmup_steps: 100
+weight_decay: 0.01
+betas: [0.9, 0.98]
+grad_clip: 1.0
+precision: bf16
+allow_tf32: true
+dist_timeout_minutes: 120
+prefetch_factor: 3
+log_interval: 20
+eval_interval: 100
+save_interval: 300
+debug_items: 8
+audio:
+  sample_rate: 16000
+  n_mels: 128
+  n_fft: 1024
+  hop_length: 160
+  f_min: 30.0
+  f_max: 8000.0
+targets:
+  onset_width_frames: 1
+  offset_width_frames: 1
+  min_note_seconds: 0.02
+model:
+  n_mels: 128
+  d_model: 256
+  encoder_layers: 4
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.1
+  conv_channels: 256
+  head_hidden: 256
+loss:
+  onset_weight: 1.0
+  frame_weight: 0.5
+  offset_weight: 0.7
+  velocity_weight: 0.08
+  onset_pos_weight: 12.0
+  frame_pos_weight: 2.5
+  offset_pos_weight: 12.0
+decode:
+  onset_threshold: 0.45
+  frame_threshold: 0.35
+  offset_threshold: 0.35
+  min_note_seconds: 0.04
+  max_notes_per_second: 45.0
