@@ -94,6 +94,8 @@ class DenseAMTDataset(Dataset):
                 str(self.feature_config.hop_length),
                 str(self.target_config.onset_width_frames),
                 str(self.target_config.offset_width_frames),
+                str(self.target_config.onset_soft_radius_frames),
+                str(self.target_config.offset_soft_radius_frames),
                 str(self.target_config.min_note_seconds),
                 str(self.target_config.include_pedal),
                 str(self.target_config.include_duration),

@@ -7,7 +7,7 @@ audio -> log-mel -> dense piano AMT -> post-processing -> MIDI/MusicXML -> local
 ```
 
 The current practical line is the dense AMT family. v5.3 is the stable display baseline, v5.4 adds ScorePolish
-readable-score interpretation, and v7 is the active quality push toward stronger MT3/Onsets-and-Frames style behavior.
+readable-score interpretation, and v8 is the active quality push toward stronger MT3/Onsets-and-Frames style behavior.
 Earlier seq2seq/MT3-style experiments are kept in the repository for ablations, but the recommended inference path is
 `scripts/infer_amt.py`.
 
@@ -106,6 +106,42 @@ torchrun --standalone --nproc_per_node=8 scripts/train_amt.py --config configs/t
 The v7 data loader reads only the requested WAV segment instead of loading the full performance for every 2s clip. This
 matters when the training cache is cold.
 
+v8 is the current response to low note F1 and poor long-note/chord behavior. The key diagnosis is that v7's 2s windows
+and 123k clips are still too small compared with stronger piano AMT systems, which typically rely on onset-constrained
+frame modeling, explicit offset/pedal targets, much larger segment coverage, and long training schedules. v8 keeps the
+stable dense AMT path, starts from the v7 best checkpoint, moves to 4s clips, adds soft onset/offset boundary targets,
+uses a 184k-clip manifest, extends duration supervision to 12s, and adds zero-gated extra context layers so new capacity
+can learn without destroying the initialized v7 behavior:
+
+```bash
+python scripts/build_amt_manifest.py \
+  --index data/cache/maestro_index.json \
+  --split train \
+  --out data/cache/amt_train_4s_uniform192_v8.json \
+  --clip_seconds 4.0 \
+  --stride_seconds 2.0 \
+  --max_clips_per_piece 192 \
+  --sampling uniform \
+  --seed 137
+
+python scripts/build_amt_manifest.py \
+  --index data/cache/maestro_index.json \
+  --split validation \
+  --out data/cache/amt_val_4s_s8_v8.json \
+  --clip_seconds 4.0 \
+  --stride_seconds 8.0 \
+  --max_clips_per_piece 2 \
+  --sampling grid \
+  --seed 137
+
+python scripts/train_amt.py --config configs/train_amt_v8_context4_soft_smoke.yaml
+torchrun --standalone --nproc_per_node=8 scripts/train_amt.py --config configs/train_amt_v8_context4_soft.yaml
+```
+
+Use v8 for new quality experiments. If it improves note F1 but remains underfitted, the next safe capacity step is to
+raise `batch_size` and training steps first, then widen `d_model/head_hidden`; widening the backbone resets more weights
+and should be treated as a separate ablation.
+
 v5.4 ScorePolish is an inference/post-processing layer rather than a new architecture checkpoint. It separates
 performance MIDI from readable score export, prunes pedal-resonance long notes from the score path, estimates
 key/tempo, quantizes to a beat grid, uses dynamic-programming hand assignment, trims overlapping score durations per
@@ -137,7 +173,16 @@ Useful display controls:
 --score_max_notes_per_beat 8      # lower for cleaner scores, higher for dense passages
 --score_max_overlap_beats 0.0     # keep score durations from overlapping the next hand event
 --disable_score_overlap_trim      # keep longer notated durations for ablation
+--time_signature 12/8             # useful for compound-meter pieces such as Merry Christmas Mr. Lawrence
+--score_beat_divisions 2,4        # suppress triplet clutter; add 3 only for real tuplets
+--score_max_short_rest_beats 0.75 # fill tiny score gaps by extending notes to the next onset
+--disable_score_key_filter        # ablation: keep weak chromatic/non-key notes
 ```
+
+The score path is intentionally stricter than the performance MIDI path. It now filters weak non-key/isolated notes,
+suppresses tuplets by default, fills short notation gaps, and spells pitches according to the chosen key signature.
+For ablations, compare `--disable_score_key_filter`, `--disable_score_isolation_filter`,
+`--disable_score_fill_rests`, and `--score_allow_tuplets`.
 
 Legacy seq2seq training is still available:
 

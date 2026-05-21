@@ -15,6 +15,8 @@ NUM_PITCHES = PITCH_MAX - PITCH_MIN + 1
 class DenseTargetConfig:
     onset_width_frames: int = 1
     offset_width_frames: int = 1
+    onset_soft_radius_frames: int = 0
+    offset_soft_radius_frames: int = 0
     min_note_seconds: float = 0.02
     include_pedal: bool = False
     include_duration: bool = False
@@ -116,20 +118,55 @@ def _write_note(
     end_idx = min(frames, end_idx)
     frame[start_idx:end_idx, pitch_idx] = 1.0
     if write_onset:
-        lo = max(0, start_idx - cfg.onset_width_frames)
-        hi = min(frames, start_idx + cfg.onset_width_frames + 1)
-        onset[lo:hi, pitch_idx] = 1.0
-        onset_mask[lo:hi, pitch_idx] = 1.0
-        velocity[lo:hi, pitch_idx] = max(1, min(127, int(note.velocity))) / 127.0
+        onset_indices = _write_boundary_target(
+            onset,
+            start_idx,
+            pitch_idx,
+            hard_width_frames=cfg.onset_width_frames,
+            soft_radius_frames=cfg.onset_soft_radius_frames,
+        )
+        for idx in onset_indices:
+            onset_mask[idx, pitch_idx] = 1.0
+            velocity[idx, pitch_idx] = max(1, min(127, int(note.velocity))) / 127.0
         if note_duration is not None and duration_mask is not None:
             normalized = _duration_to_unit(note.end - note.start, cfg.max_duration_seconds)
-            note_duration[lo:hi, pitch_idx] = normalized
-            duration_mask[lo:hi, pitch_idx] = 1.0
+            for idx in onset_indices:
+                note_duration[idx, pitch_idx] = normalized
+                duration_mask[idx, pitch_idx] = 1.0
     if note.end < duration - 1e-4:
         offset_idx = min(frames - 1, max(0, end_idx - 1))
-        lo = max(0, offset_idx - cfg.offset_width_frames)
-        hi = min(frames, offset_idx + cfg.offset_width_frames + 1)
-        offset[lo:hi, pitch_idx] = 1.0
+        _write_boundary_target(
+            offset,
+            offset_idx,
+            pitch_idx,
+            hard_width_frames=cfg.offset_width_frames,
+            soft_radius_frames=cfg.offset_soft_radius_frames,
+        )
+
+
+def _write_boundary_target(
+    target: torch.Tensor,
+    center_idx: int,
+    pitch_idx: int,
+    hard_width_frames: int,
+    soft_radius_frames: int,
+) -> list[int]:
+    """Write a hard or triangular boundary target and return supervised frames."""
+    frames = target.shape[0]
+    if soft_radius_frames > 0:
+        radius = int(soft_radius_frames)
+        written: list[int] = []
+        for idx in range(max(0, center_idx - radius), min(frames, center_idx + radius + 1)):
+            distance = abs(idx - center_idx)
+            value = 1.0 - (distance / float(radius + 1))
+            target[idx, pitch_idx] = max(float(target[idx, pitch_idx]), value)
+            written.append(idx)
+        return written
+    width = max(0, int(hard_width_frames))
+    lo = max(0, center_idx - width)
+    hi = min(frames, center_idx + width + 1)
+    target[lo:hi, pitch_idx] = 1.0
+    return list(range(lo, hi))
 
 
 def _time_to_frame(seconds: float, duration: float, frames: int, end: bool = False) -> int:

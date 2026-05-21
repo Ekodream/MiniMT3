@@ -11,14 +11,40 @@ MAJOR_PROFILE = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.2
 MINOR_PROFILE = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
 MAJOR_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 MINOR_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "G#", "A", "Bb", "B"]
+PITCH_CLASS = {
+    "C": 0,
+    "B#": 0,
+    "C#": 1,
+    "Db": 1,
+    "D": 2,
+    "D#": 3,
+    "Eb": 3,
+    "E": 4,
+    "Fb": 4,
+    "E#": 5,
+    "F": 5,
+    "F#": 6,
+    "Gb": 6,
+    "G": 7,
+    "G#": 8,
+    "Ab": 8,
+    "A": 9,
+    "A#": 10,
+    "Bb": 10,
+    "B": 11,
+    "Cb": 11,
+}
+MAJOR_SCALE = {0, 2, 4, 5, 7, 9, 11}
+MINOR_SCALE = {0, 2, 3, 5, 7, 8, 10}
 
 
 @dataclass
 class ScorePolishConfig:
     key_signature: str | None = None
-    time_signature: str = "4/4"
+    time_signature: str = "auto"
     tempo_bpm: float | None = None
-    beat_divisions: tuple[int, ...] = (2, 3, 4)
+    beat_divisions: tuple[int, ...] = (2, 4)
+    allow_tuplets: bool = False
     chord_tolerance_seconds: float = 0.055
     arpeggio_min_gap_seconds: float = 0.08
     arpeggio_max_gap_seconds: float = 0.25
@@ -31,6 +57,16 @@ class ScorePolishConfig:
     trim_score_overlaps: bool = True
     max_overlap_beats: float = 0.0
     prune_pedal_resonance: bool = True
+    filter_key_outliers: bool = True
+    non_key_max_velocity: int = 54
+    non_key_max_note_beats: float = 0.75
+    filter_isolated_notes: bool = True
+    isolated_max_velocity: int = 48
+    isolated_max_note_beats: float = 0.75
+    isolation_window_beats: float = 1.0
+    isolation_pitch_window: int = 12
+    fill_short_rests: bool = True
+    max_short_rest_beats: float = 0.5
 
 
 @dataclass
@@ -70,10 +106,21 @@ def polish_score_notes(
     key_signature = cfg.key_signature or estimate_key_signature(base)
     tempo_bpm = float(cfg.tempo_bpm or estimate_tempo_bpm(base))
     seconds_per_quarter = 60.0 / max(20.0, tempo_bpm)
+    time_signature = infer_time_signature(base, tempo_bpm, cfg) if cfg.time_signature == "auto" else cfg.time_signature
+    beat_divisions = _score_beat_divisions(cfg, time_signature)
+    base, key_outlier_rate = _filter_key_outliers(base, key_signature, seconds_per_quarter, cfg)
+    base, isolated_rate = _filter_isolated_notes(base, seconds_per_quarter, cfg)
     pruned, long_note_rate = _prune_long_notes(base, seconds_per_quarter, cfg)
     density_limited, density_pruned_rate = _limit_note_density(pruned, seconds_per_quarter, cfg)
-    quantized, quant_error, collapse_rate = _quantize_to_beat_grid(density_limited, seconds_per_quarter, cfg)
+    quantized, quant_error, collapse_rate = _quantize_to_beat_grid(
+        density_limited,
+        seconds_per_quarter,
+        cfg,
+        beat_divisions=beat_divisions,
+    )
     right, left, hand_crossings = assign_hands_dp(quantized, cfg)
+    right, right_fill_rate = _fill_short_rests(right, seconds_per_quarter, cfg)
+    left, left_fill_rate = _fill_short_rests(left, seconds_per_quarter, cfg)
     right, right_overlap_trim_rate = _trim_hand_overlaps(right, seconds_per_quarter, cfg)
     left, left_overlap_trim_rate = _trim_hand_overlaps(left, seconds_per_quarter, cfg)
     score_notes = sorted(right + left, key=lambda n: (n.start, n.pitch, n.end))
@@ -81,6 +128,9 @@ def polish_score_notes(
         "quantization_error_seconds": quant_error,
         "long_note_rate": long_note_rate,
         "density_pruned_rate": density_pruned_rate,
+        "key_outlier_pruned_rate": key_outlier_rate,
+        "isolated_pruned_rate": isolated_rate,
+        "short_rest_fill_rate": (right_fill_rate + left_fill_rate) / 2.0,
         "overlap_trim_rate": (right_overlap_trim_rate + left_overlap_trim_rate) / 2.0,
         "chord_collapse_rate": collapse_rate,
         "hand_crossings": float(hand_crossings),
@@ -92,10 +142,10 @@ def polish_score_notes(
         right_notes=right,
         left_notes=left,
         key_signature=key_signature,
-        time_signature=cfg.time_signature,
+        time_signature=time_signature,
         tempo_bpm=tempo_bpm,
         seconds_per_quarter=seconds_per_quarter,
-        beat_divisions=cfg.beat_divisions,
+        beat_divisions=beat_divisions,
         metrics=metrics,
     )
 
@@ -140,6 +190,27 @@ def estimate_tempo_bpm(notes: list[NoteEvent], min_bpm: int = 50, max_bpm: int =
             best_score = score
             best_bpm = bpm
     return float(best_bpm)
+
+
+def infer_time_signature(notes: list[NoteEvent], tempo_bpm: float, cfg: ScorePolishConfig | None = None) -> str:
+    cfg = cfg or ScorePolishConfig()
+    if not notes:
+        return "4/4"
+    spq = 60.0 / max(20.0, tempo_bpm)
+    onsets = sorted({round(n.start, 4) for n in notes})
+    if len(onsets) < 12:
+        return "4/4"
+    iois = [b - a for a, b in zip(onsets, onsets[1:]) if 0.04 <= b - a <= 1.5 * spq]
+    if not iois:
+        return "4/4"
+    med_ioi = median(iois)
+    eighth_like = 0.38 * spq <= med_ioi <= 0.68 * spq
+    sixteenth_like = 0.18 * spq <= med_ioi < 0.38 * spq
+    if eighth_like or sixteenth_like:
+        compound_score = _compound_group_score(onsets, spq)
+        if compound_score >= 0.52:
+            return "12/8"
+    return "4/4"
 
 
 def assign_hands_dp(
@@ -208,6 +279,71 @@ def _filter_score_notes(notes: list[NoteEvent], cfg: ScorePolishConfig) -> list[
     return limited
 
 
+def _filter_key_outliers(
+    notes: list[NoteEvent],
+    key_signature: str,
+    seconds_per_quarter: float,
+    cfg: ScorePolishConfig,
+) -> tuple[list[NoteEvent], float]:
+    if not notes or not cfg.filter_key_outliers:
+        return notes, 0.0
+    scale = _scale_pitch_classes(key_signature)
+    if scale is None:
+        return notes, 0.0
+    groups = _group_by_start(notes, tolerance=cfg.chord_tolerance_seconds)
+    keep: list[NoteEvent] = []
+    pruned = 0
+    short_limit = max(0.03, cfg.non_key_max_note_beats * seconds_per_quarter)
+    for group in groups:
+        for note in group:
+            in_key = int(note.pitch) % 12 in scale
+            protected = len(group) >= 2 or note.velocity > cfg.non_key_max_velocity or note.end - note.start > short_limit
+            if not in_key and not protected:
+                pruned += 1
+            else:
+                keep.append(note)
+    keep.sort(key=lambda n: (n.start, n.pitch, n.end))
+    return keep, pruned / max(1, len(notes))
+
+
+def _filter_isolated_notes(
+    notes: list[NoteEvent],
+    seconds_per_quarter: float,
+    cfg: ScorePolishConfig,
+) -> tuple[list[NoteEvent], float]:
+    if not notes or not cfg.filter_isolated_notes:
+        return notes, 0.0
+    groups = _group_by_start(notes, tolerance=cfg.chord_tolerance_seconds)
+    group_size = {id(note): len(group) for group in groups for note in group}
+    time_window = max(0.05, cfg.isolation_window_beats * seconds_per_quarter)
+    short_limit = max(0.03, cfg.isolated_max_note_beats * seconds_per_quarter)
+    keep: list[NoteEvent] = []
+    pruned = 0
+    ordered = sorted(notes, key=lambda n: (n.start, n.pitch, n.end))
+    for idx, note in enumerate(ordered):
+        protected = (
+            group_size.get(id(note), 1) >= 2
+            or note.velocity > cfg.isolated_max_velocity
+            or note.end - note.start > short_limit
+        )
+        if protected:
+            keep.append(note)
+            continue
+        supported = False
+        for other in ordered[max(0, idx - 10) : min(len(ordered), idx + 11)]:
+            if other is note:
+                continue
+            if abs(other.start - note.start) <= time_window and abs(other.pitch - note.pitch) <= cfg.isolation_pitch_window:
+                supported = True
+                break
+        if supported:
+            keep.append(note)
+        else:
+            pruned += 1
+    keep.sort(key=lambda n: (n.start, n.pitch, n.end))
+    return keep, pruned / max(1, len(notes))
+
+
 def _prune_long_notes(
     notes: list[NoteEvent],
     seconds_per_quarter: float,
@@ -245,10 +381,11 @@ def _quantize_to_beat_grid(
     notes: list[NoteEvent],
     seconds_per_quarter: float,
     cfg: ScorePolishConfig,
+    beat_divisions: tuple[int, ...] | None = None,
 ) -> tuple[list[NoteEvent], float, float]:
     if not notes:
         return [], 0.0, 0.0
-    divisions = tuple(sorted({max(1, int(d)) for d in cfg.beat_divisions}))
+    divisions = tuple(sorted({max(1, int(d)) for d in (beat_divisions or cfg.beat_divisions)}))
     min_step = seconds_per_quarter / max(divisions)
     min_duration = max(0.03, cfg.min_note_beats * seconds_per_quarter)
     quantized: list[NoteEvent] = []
@@ -338,6 +475,35 @@ def _trim_hand_overlaps(
     return trimmed, changed / max(1, len(notes))
 
 
+def _fill_short_rests(
+    notes: list[NoteEvent],
+    seconds_per_quarter: float,
+    cfg: ScorePolishConfig,
+) -> tuple[list[NoteEvent], float]:
+    if not notes or not cfg.fill_short_rests:
+        return notes, 0.0
+    groups = _group_by_start(notes, tolerance=1e-5)
+    changed = 0
+    max_gap = max(0.0, cfg.max_short_rest_beats) * seconds_per_quarter
+    filled: list[NoteEvent] = []
+    for idx, group in enumerate(groups):
+        next_start = groups[idx + 1][0].start if idx + 1 < len(groups) else None
+        group_end = max(n.end for n in group)
+        target_end = group_end
+        if next_start is not None:
+            gap = next_start - group_end
+            if 0.0 < gap <= max_gap:
+                target_end = next_start
+        for note in group:
+            end = note.end
+            if target_end > end and target_end - note.start <= cfg.max_note_beats * seconds_per_quarter * 1.25:
+                end = target_end
+                changed += 1
+            filled.append(NoteEvent(note.pitch, note.start, end, note.velocity))
+    filled.sort(key=lambda n: (n.start, n.pitch, n.end))
+    return filled, changed / max(1, len(notes))
+
+
 def _quantize_seconds(seconds: float, seconds_per_quarter: float, divisions: tuple[int, ...]) -> float:
     best = 0.0
     best_error = math.inf
@@ -349,6 +515,50 @@ def _quantize_seconds(seconds: float, seconds_per_quarter: float, divisions: tup
             best_error = error
             best = candidate
     return max(0.0, best)
+
+
+def _score_beat_divisions(cfg: ScorePolishConfig, time_signature: str) -> tuple[int, ...]:
+    divisions = tuple(sorted({max(1, int(d)) for d in cfg.beat_divisions})) or (2, 4)
+    if not cfg.allow_tuplets:
+        divisions = tuple(d for d in divisions if d % 3 != 0)
+    if not divisions:
+        divisions = (2, 4)
+    if str(time_signature).strip() in {"6/8", "9/8", "12/8"} and not cfg.allow_tuplets:
+        divisions = tuple(sorted(set(divisions + (2, 4))))
+    return divisions
+
+
+def _compound_group_score(onsets: list[float], seconds_per_quarter: float) -> float:
+    eighth = seconds_per_quarter / 2.0
+    if eighth <= 0:
+        return 0.0
+    hits = 0
+    total = 0
+    for onset in onsets:
+        eighth_index = int(round(onset / eighth))
+        err = abs(onset - eighth_index * eighth)
+        if err <= 0.18 * eighth:
+            total += 1
+            if eighth_index % 3 in {0, 1, 2}:
+                hits += 1
+    if total == 0:
+        return 0.0
+    dense = min(1.0, total / max(1.0, (onsets[-1] - onsets[0]) / eighth * 0.35))
+    return dense * hits / total
+
+
+def _scale_pitch_classes(key_signature: str) -> set[int] | None:
+    parts = str(key_signature).strip().replace("-", "b").split()
+    if not parts:
+        return None
+    mode = parts[-1].lower() if parts[-1].lower() in {"major", "minor"} else "major"
+    tonic = " ".join(parts[:-1]) if mode in {"major", "minor"} and len(parts) > 1 else parts[0]
+    tonic = tonic.replace("♭", "b").replace("♯", "#")
+    pc = PITCH_CLASS.get(tonic)
+    if pc is None:
+        return None
+    scale = MINOR_SCALE if mode == "minor" else MAJOR_SCALE
+    return {(pc + degree) % 12 for degree in scale}
 
 
 def _group_by_start(notes: list[NoteEvent], tolerance: float) -> list[list[NoteEvent]]:

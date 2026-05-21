@@ -111,11 +111,13 @@ decode:
   score_min_note_seconds: 0.125
   score_min_velocity: 6
   score_max_chord_notes: 10
-  time_signature: "4/4"
-  score_beat_divisions: "2,3,4"
+  time_signature: "auto"
+  score_beat_divisions: "2,4"
+  score_allow_tuplets: false
   score_chord_tolerance_seconds: 0.055
   score_max_note_beats: 4.0
   score_min_note_beats: 0.25
   score_max_notes_per_beat: 6
   score_merge_extension_seconds: 0.25
   score_max_overlap_beats: 0.0
+  score_max_short_rest_beats: 0.5

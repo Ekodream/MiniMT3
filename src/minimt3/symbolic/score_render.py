@@ -60,8 +60,8 @@ def notes_to_score(
         tempo_bpm=None,
         pedals=[],
     )
-    _fill_part(right_part, right, seconds_per_quarter, beat_divisions=beat_divisions)
-    _fill_part(left_part, left, seconds_per_quarter, beat_divisions=beat_divisions)
+    _fill_part(right_part, right, seconds_per_quarter, beat_divisions=beat_divisions, key_signature=key_signature)
+    _fill_part(left_part, left, seconds_per_quarter, beat_divisions=beat_divisions, key_signature=key_signature)
     score.insert(0, right_part)
     score.insert(0, left_part)
     try:
@@ -137,6 +137,7 @@ def _fill_part(
     notes: list[NoteEvent],
     seconds_per_quarter: float,
     beat_divisions: tuple[int, ...] = (4,),
+    key_signature: str | None = None,
 ) -> None:
     by_start: dict[float, list[NoteEvent]] = {}
     for item in notes:
@@ -157,9 +158,9 @@ def _fill_part(
             min_value=_min_quarter(beat_divisions),
         )
         if len(group) == 1:
-            element = note.Note(pitch.Pitch(midi=group[0].pitch))
+            element = note.Note(_make_pitch(group[0].pitch, key_signature))
         else:
-            element = chord.Chord([pitch.Pitch(midi=n.pitch) for n in group])
+            element = chord.Chord([_make_pitch(n.pitch, key_signature) for n in group])
         element.duration = duration.Duration(q_len)
         part.insert(q_offset, element)
         last_offset = max(last_offset, q_offset + q_len)
@@ -211,6 +212,32 @@ def _make_key(key_signature: str) -> m21key.Key:
     if len(parts) >= 2 and parts[-1].lower() in {"major", "minor"}:
         return m21key.Key(" ".join(parts[:-1]), parts[-1].lower())
     return m21key.Key(value)
+
+
+def _make_pitch(midi: int, key_signature: str | None = None) -> pitch.Pitch:
+    if not key_signature:
+        return pitch.Pitch(midi=int(midi))
+    prefer_flats = _prefer_flats(key_signature)
+    names = (
+        ["C", "D-", "D", "E-", "E", "F", "G-", "G", "A-", "A", "B-", "B"]
+        if prefer_flats
+        else ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    )
+    pc = int(midi) % 12
+    octave = int(midi) // 12 - 1
+    return pitch.Pitch(f"{names[pc]}{octave}")
+
+
+def _prefer_flats(key_signature: str) -> bool:
+    value = str(key_signature).replace("♭", "b").strip()
+    tonic = value.split()[0] if value else ""
+    flat_keys = {"F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"}
+    sharp_keys = {"G", "D", "A", "E", "B", "F#", "C#"}
+    if tonic in flat_keys:
+        return True
+    if tonic in sharp_keys:
+        return False
+    return "b" in tonic and "#" not in tonic
 
 
 def _quantize_quarter(

@@ -62,8 +62,10 @@ def main() -> None:
     parser.add_argument("--disable_score_polish", action="store_true")
     parser.add_argument("--key_signature")
     parser.add_argument("--time_signature")
+    parser.add_argument("--auto_time_signature", action="store_true")
     parser.add_argument("--tempo_bpm", type=float)
     parser.add_argument("--score_beat_divisions")
+    parser.add_argument("--score_allow_tuplets", action="store_true")
     parser.add_argument("--score_chord_tolerance_seconds", type=float)
     parser.add_argument("--score_max_note_beats", type=float)
     parser.add_argument("--score_min_note_beats", type=float)
@@ -71,6 +73,10 @@ def main() -> None:
     parser.add_argument("--score_merge_extension_seconds", type=float)
     parser.add_argument("--disable_score_overlap_trim", action="store_true")
     parser.add_argument("--score_max_overlap_beats", type=float)
+    parser.add_argument("--disable_score_key_filter", action="store_true")
+    parser.add_argument("--disable_score_isolation_filter", action="store_true")
+    parser.add_argument("--disable_score_fill_rests", action="store_true")
+    parser.add_argument("--score_max_short_rest_beats", type=float)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -151,6 +157,8 @@ def main() -> None:
     score_max_chord_notes = int(args.score_max_chord_notes or decode_cfg.get("score_max_chord_notes", 10))
     key_signature = args.key_signature or decode_cfg.get("key_signature")
     time_signature = args.time_signature or decode_cfg.get("time_signature", "4/4")
+    if args.auto_time_signature:
+        time_signature = "auto"
     tempo_bpm = args.tempo_bpm if args.tempo_bpm is not None else decode_cfg.get("tempo_bpm")
     score_beat_divisions = _parse_int_tuple(
         args.score_beat_divisions or str(decode_cfg.get("score_beat_divisions", "2,3,4"))
@@ -165,6 +173,12 @@ def main() -> None:
         args.score_merge_extension_seconds or decode_cfg.get("score_merge_extension_seconds", 0.25)
     )
     score_max_overlap_beats = float(args.score_max_overlap_beats or decode_cfg.get("score_max_overlap_beats", 0.0))
+    score_allow_tuplets = bool(args.score_allow_tuplets or decode_cfg.get("score_allow_tuplets", False))
+    score_max_short_rest_beats = float(
+        args.score_max_short_rest_beats
+        if args.score_max_short_rest_beats is not None
+        else decode_cfg.get("score_max_short_rest_beats", 0.5)
+    )
     audio_cfg = LogMelConfig(**cfg.get("audio", {}))
     model = DenseAMT(DenseAMTConfig(**cfg.get("model", {}))).to(device)
     model.load_state_dict(ckpt["model"], strict=False)
@@ -272,6 +286,7 @@ def main() -> None:
                 time_signature=time_signature,
                 tempo_bpm=float(tempo_bpm) if tempo_bpm is not None else None,
                 beat_divisions=score_beat_divisions,
+                allow_tuplets=score_allow_tuplets,
                 chord_tolerance_seconds=score_chord_tolerance_seconds,
                 min_note_beats=score_min_note_beats,
                 max_note_beats=score_max_note_beats,
@@ -280,6 +295,10 @@ def main() -> None:
                 max_notes_per_beat=score_max_notes_per_beat,
                 trim_score_overlaps=not args.disable_score_overlap_trim,
                 max_overlap_beats=score_max_overlap_beats,
+                filter_key_outliers=not args.disable_score_key_filter,
+                filter_isolated_notes=not args.disable_score_isolation_filter,
+                fill_short_rests=not args.disable_score_fill_rests,
+                max_short_rest_beats=score_max_short_rest_beats,
             ),
         )
         score_notes = polished.notes
@@ -360,6 +379,7 @@ def main() -> None:
                 "time_signature": time_signature,
                 "tempo_bpm": tempo_bpm,
                 "score_beat_divisions": list(score_beat_divisions),
+                "score_allow_tuplets": score_allow_tuplets,
                 "score_chord_tolerance_seconds": score_chord_tolerance_seconds,
                 "score_max_note_beats": score_max_note_beats,
                 "score_min_note_beats": score_min_note_beats,
@@ -367,6 +387,10 @@ def main() -> None:
                 "score_merge_extension_seconds": score_merge_extension_seconds,
                 "disable_score_overlap_trim": args.disable_score_overlap_trim,
                 "score_max_overlap_beats": score_max_overlap_beats,
+                "disable_score_key_filter": args.disable_score_key_filter,
+                "disable_score_isolation_filter": args.disable_score_isolation_filter,
+                "disable_score_fill_rests": args.disable_score_fill_rests,
+                "score_max_short_rest_beats": score_max_short_rest_beats,
             },
         },
     )

@@ -26,6 +26,8 @@ class DenseAMTConfig:
     recurrent_layers: int = 0
     recurrent_hidden: int = 128
     separate_head_towers: bool = False
+    extra_context_layers: int = 0
+    extra_context_dim_feedforward: int = 1024
 
 
 class DenseAMT(nn.Module):
@@ -60,6 +62,24 @@ class DenseAMT(nn.Module):
         else:
             self.temporal = None
             self.temporal_proj = None
+        self.extra_context = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=config.d_model,
+                    nhead=config.nhead,
+                    dim_feedforward=config.extra_context_dim_feedforward,
+                    dropout=config.dropout,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(config.extra_context_layers)
+            ]
+        )
+        if self.extra_context:
+            self.extra_context_scale = nn.Parameter(torch.zeros(len(self.extra_context)))
+        else:
+            self.register_parameter("extra_context_scale", None)
         self.shared = nn.Sequential(
             nn.LayerNorm(config.d_model),
             nn.Linear(config.d_model, config.head_hidden),
@@ -104,6 +124,10 @@ class DenseAMT(nn.Module):
         if self.temporal is not None and self.temporal_proj is not None:
             temporal, _ = self.temporal(memory)
             memory = memory + self.temporal_proj(temporal)
+        if self.extra_context:
+            for idx, layer in enumerate(self.extra_context):
+                refined = layer(memory)
+                memory = memory + self.extra_context_scale[idx] * (refined - memory)
         hidden = self.shared(memory)
         onset_hidden = self.onset_tower(hidden)
         frame_hidden = self.frame_tower(hidden)
