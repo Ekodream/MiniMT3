@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 
 import torch
 
@@ -29,6 +30,18 @@ def main() -> None:
     parser.add_argument("--max_notes_per_second", type=float)
     parser.add_argument("--min_onset_gap_seconds", type=float)
     parser.add_argument("--min_frame_at_onset", type=float)
+    parser.add_argument("--onset_frame_fusion_weight", type=float)
+    parser.add_argument("--chord_onset_threshold", type=float)
+    parser.add_argument("--chord_frame_threshold", type=float)
+    parser.add_argument("--chord_window_frames", type=int)
+    parser.add_argument("--disable_chord_recovery", action="store_true")
+    parser.add_argument("--chord_score_ratio", type=float)
+    parser.add_argument("--onset_peak_prominence", type=float)
+    parser.add_argument("--max_notes_per_start_window", type=int)
+    parser.add_argument("--start_window_seconds", type=float)
+    parser.add_argument("--disable_duration_head", action="store_true")
+    parser.add_argument("--max_duration_seconds", type=float)
+    parser.add_argument("--duration_extension_weight", type=float)
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -64,6 +77,51 @@ def main() -> None:
         if args.min_frame_at_onset is not None
         else decode_cfg.get("min_frame_at_onset", 0.0)
     )
+    onset_frame_fusion_weight = float(
+        args.onset_frame_fusion_weight
+        if args.onset_frame_fusion_weight is not None
+        else decode_cfg.get("onset_frame_fusion_weight", 0.0)
+    )
+    if args.disable_chord_recovery:
+        chord_onset_threshold = None
+    else:
+        chord_onset_threshold = (
+            float(args.chord_onset_threshold)
+            if args.chord_onset_threshold is not None
+            else decode_cfg.get("chord_onset_threshold")
+        )
+    chord_frame_threshold = float(
+        args.chord_frame_threshold
+        if args.chord_frame_threshold is not None
+        else decode_cfg.get("chord_frame_threshold", 0.35)
+    )
+    chord_window_frames = int(args.chord_window_frames or decode_cfg.get("chord_window_frames", 1))
+    chord_score_ratio = float(
+        args.chord_score_ratio
+        if args.chord_score_ratio is not None
+        else decode_cfg.get("chord_score_ratio", 0.75)
+    )
+    onset_peak_prominence = float(
+        args.onset_peak_prominence
+        if args.onset_peak_prominence is not None
+        else decode_cfg.get("onset_peak_prominence", 0.0)
+    )
+    max_notes_per_start_window = (
+        int(args.max_notes_per_start_window)
+        if args.max_notes_per_start_window is not None
+        else decode_cfg.get("max_notes_per_start_window")
+    )
+    start_window_seconds = float(
+        args.start_window_seconds
+        if args.start_window_seconds is not None
+        else decode_cfg.get("start_window_seconds", 0.08)
+    )
+    max_duration_seconds = float(args.max_duration_seconds or decode_cfg.get("max_duration_seconds", 8.0))
+    duration_extension_weight = float(
+        args.duration_extension_weight
+        if args.duration_extension_weight is not None
+        else decode_cfg.get("duration_extension_weight", 1.0)
+    )
     totals = {combo: {"note_f1": 0.0, "offset_f1": 0.0, "pred": 0, "ref": 0} for combo in combos}
     with torch.no_grad():
         for idx in range(len(dataset)):
@@ -84,6 +142,17 @@ def main() -> None:
                     max_polyphony=max_polyphony,
                     min_onset_gap_seconds=min_onset_gap_seconds,
                     min_frame_at_onset=min_frame_at_onset,
+                    onset_frame_fusion_weight=onset_frame_fusion_weight,
+                    chord_onset_threshold=chord_onset_threshold,
+                    chord_frame_threshold=chord_frame_threshold,
+                    chord_window_frames=chord_window_frames,
+                    chord_score_ratio=chord_score_ratio,
+                    onset_peak_prominence=onset_peak_prominence,
+                    max_notes_per_start_window=max_notes_per_start_window,
+                    start_window_seconds=start_window_seconds,
+                    use_duration_head=not args.disable_duration_head,
+                    max_duration_seconds=max_duration_seconds,
+                    duration_extension_weight=duration_extension_weight,
                 )
                 metric = note_metrics(notes, ref_notes)
                 totals[combo]["note_f1"] += metric["note_f1"]
@@ -107,7 +176,7 @@ def main() -> None:
         note_f1 = values["note_f1"] / count
         offset_f1 = values["offset_f1"] / count
         pred_ref = values["pred"] / max(1, values["ref"])
-        score = 10.0 * note_f1 + offset_f1 - 0.5 * min(abs(pred_ref - 1.0), 2.0)
+        score = selection_score(note_f1, offset_f1, pred_ref)
         print(
             "amt_summary "
             f"onset_t={combo[0]:.2f} frame_t={combo[1]:.2f} offset_t={combo[2]:.2f} "
@@ -124,6 +193,15 @@ def main() -> None:
 
 def _floats(value: str) -> list[float]:
     return [float(x.strip()) for x in value.split(",") if x.strip()]
+
+
+def selection_score(note_f1: float, offset_f1: float, pred_ref_ratio: float) -> float:
+    if pred_ref_ratio <= 0:
+        return -1e9
+    ratio_error = abs(math.log(max(1e-6, pred_ref_ratio)))
+    over_generation = max(0.0, pred_ref_ratio - 1.35)
+    under_generation = max(0.0, 0.55 - pred_ref_ratio)
+    return 10.0 * note_f1 + offset_f1 - 1.15 * ratio_error - 0.65 * over_generation - 0.35 * under_generation
 
 
 def note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dict[str, float]:

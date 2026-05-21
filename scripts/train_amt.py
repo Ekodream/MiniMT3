@@ -202,6 +202,7 @@ def evaluate(model, loader, criterion, device, use_amp: bool, amp_dtype: torch.d
 
 @torch.no_grad()
 def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], step: int) -> dict[str, float]:
+    was_training = model.training
     model.eval()
     decode_cfg = cfg.get("decode", {})
     max_items = min(int(cfg.get("debug_items", 8)), len(dataset))
@@ -212,6 +213,9 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
         row = sample["meta"]
         duration = float(row.get("end_sec", row.get("duration", 0.0))) - float(row.get("start_sec", 0.0))
         out = model(features)
+        chord_onset_threshold = decode_cfg.get("chord_onset_threshold")
+        if bool(decode_cfg.get("disable_chord_recovery", False)):
+            chord_onset_threshold = None
         notes = decode_dense_notes(
             out,
             duration=duration,
@@ -223,6 +227,17 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
             max_polyphony=int(decode_cfg.get("max_polyphony", 12)),
             min_onset_gap_seconds=float(decode_cfg.get("min_onset_gap_seconds", 0.06)),
             min_frame_at_onset=float(decode_cfg.get("min_frame_at_onset", 0.0)),
+            onset_frame_fusion_weight=float(decode_cfg.get("onset_frame_fusion_weight", 0.0)),
+            chord_onset_threshold=chord_onset_threshold,
+            chord_frame_threshold=float(decode_cfg.get("chord_frame_threshold", 0.35)),
+            chord_window_frames=int(decode_cfg.get("chord_window_frames", 1)),
+            chord_score_ratio=float(decode_cfg.get("chord_score_ratio", 0.75)),
+            onset_peak_prominence=float(decode_cfg.get("onset_peak_prominence", 0.0)),
+            max_notes_per_start_window=decode_cfg.get("max_notes_per_start_window"),
+            start_window_seconds=float(decode_cfg.get("start_window_seconds", 0.08)),
+            use_duration_head=bool(decode_cfg.get("use_duration_head", True)),
+            max_duration_seconds=float(decode_cfg.get("max_duration_seconds", 8.0)),
+            duration_extension_weight=float(decode_cfg.get("duration_extension_weight", 1.0)),
         )
         ref_notes, _ = load_midi_events(row["midi"], start=float(row["start_sec"]), end=float(row["end_sec"]))
         metric = note_metrics(notes, ref_notes)
@@ -250,12 +265,25 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
         f"pred_ref_ratio={pred_ref:.3f} pred_notes={totals['pred']} ref_notes={totals['ref']}",
         flush=True,
     )
+    if was_training:
+        model.train()
     return summary
 
 
 def selection_score(debug: dict[str, float]) -> float:
-    ratio_error = min(abs(float(debug.get("pred_ref_ratio", 0.0)) - 1.0), 2.0)
-    return 10.0 * float(debug.get("note_f1", 0.0)) + float(debug.get("offset_f1", 0.0)) - 0.5 * ratio_error
+    pred_ref_ratio = float(debug.get("pred_ref_ratio", 0.0))
+    if pred_ref_ratio <= 0:
+        return -math.inf
+    ratio_error = abs(math.log(max(1e-6, pred_ref_ratio)))
+    over_generation = max(0.0, pred_ref_ratio - 1.35)
+    under_generation = max(0.0, 0.55 - pred_ref_ratio)
+    return (
+        10.0 * float(debug.get("note_f1", 0.0))
+        + float(debug.get("offset_f1", 0.0))
+        - 1.15 * ratio_error
+        - 0.65 * over_generation
+        - 0.35 * under_generation
+    )
 
 
 def note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dict[str, float]:

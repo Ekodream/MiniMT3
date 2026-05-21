@@ -1,0 +1,99 @@
+seed: 101
+train_manifest: data/cache/amt_train_2s_s1_v52.json
+val_manifest: data/cache/amt_val_2s_s4.json
+train_split: train
+val_split: validation
+output_dir: outputs/ckpt_amt_v5_4_head_plus
+init_from: outputs/ckpt_amt_v5_3_pedal_score/best.pt
+train_cache_dir: data/cache/amt_v53_train_2s_s1_pedal
+val_cache_dir: data/cache/amt_v53_val_2s_pedal
+max_items:
+val_max_items: 96
+batch_size: 64
+eval_batch_size: 32
+num_workers: 4
+eval_workers: 2
+epochs: 500
+max_steps: 1600
+lr: 0.000008
+min_lr: 0.0000035
+warmup_steps: 50
+weight_decay: 0.01
+betas: [0.9, 0.98]
+grad_clip: 1.0
+precision: bf16
+allow_tf32: true
+dist_timeout_minutes: 120
+prefetch_factor: 3
+log_interval: 30
+eval_interval: 150
+save_interval: 300
+debug_items: 12
+audio:
+  sample_rate: 16000
+  n_mels: 128
+  n_fft: 1024
+  hop_length: 160
+  f_min: 30.0
+  f_max: 8000.0
+targets:
+  onset_width_frames: 0
+  offset_width_frames: 1
+  min_note_seconds: 0.02
+  include_pedal: true
+model:
+  n_mels: 128
+  d_model: 256
+  encoder_layers: 4
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.1
+  conv_channels: 256
+  head_hidden: 384
+  predict_pedal: true
+loss:
+  onset_weight: 1.25
+  frame_weight: 0.50
+  offset_weight: 0.75
+  velocity_weight: 0.08
+  pedal_weight: 0.35
+  onset_pos_weight: 6.5
+  frame_pos_weight: 2.0
+  offset_pos_weight: 6.0
+  pedal_pos_weight: 3.0
+  onset_neg_weight: 1.20
+  frame_neg_weight: 1.05
+  offset_neg_weight: 1.10
+  pedal_neg_weight: 1.0
+  onset_focal_gamma_pos: 0.0
+  onset_focal_gamma_neg: 1.0
+  frame_focal_gamma_pos: 0.0
+  frame_focal_gamma_neg: 0.5
+  offset_focal_gamma_pos: 0.0
+  offset_focal_gamma_neg: 0.5
+decode:
+  onset_threshold: 0.38
+  frame_threshold: 0.12
+  offset_threshold: 0.15
+  min_note_seconds: 0.05
+  max_notes_per_second: 48.0
+  max_polyphony: 16
+  min_onset_gap_seconds: 0.04
+  min_frame_at_onset: 0.0
+  merge_tolerance_seconds: 0.07
+  pedal_threshold: 0.50
+  performance_min_note_seconds: 0.06
+  performance_min_velocity: 4
+  sustain_max_extension: 1.5
+  score_quantize_seconds: 0.125
+  score_min_note_seconds: 0.125
+  score_min_velocity: 6
+  score_max_chord_notes: 10
+  time_signature: "4/4"
+  score_beat_divisions: "2,3,4"
+  score_chord_tolerance_seconds: 0.055
+  score_max_note_beats: 4.0
+  score_min_note_beats: 0.25
+  score_max_notes_per_beat: 8
+  score_merge_extension_seconds: 0.25
+  score_max_overlap_beats: 0.0

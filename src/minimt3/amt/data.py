@@ -63,11 +63,14 @@ class DenseAMTDataset(Dataset):
     def _build_item(self, row: dict[str, Any]) -> dict[str, torch.Tensor | dict[str, Any]]:
         start = float(row.get("start_sec", 0.0))
         end = float(row.get("end_sec", start + float(row.get("duration", 0.0) or 0.0)))
-        waveform = load_audio(row["audio"], self.feature_config.sample_rate)
-        start_sample = int(start * self.feature_config.sample_rate)
-        end_sample = int(end * self.feature_config.sample_rate)
-        waveform = waveform[:, start_sample:end_sample]
-        target_samples = max(1, int((end - start) * self.feature_config.sample_rate))
+        clip_duration = max(0.01, end - start)
+        waveform = load_audio(
+            row["audio"],
+            self.feature_config.sample_rate,
+            offset_seconds=start,
+            duration_seconds=clip_duration,
+        )
+        target_samples = max(1, int(clip_duration * self.feature_config.sample_rate))
         if waveform.shape[-1] < target_samples:
             waveform = torch.nn.functional.pad(waveform, (0, target_samples - waveform.shape[-1]))
         with torch.no_grad():
@@ -92,6 +95,9 @@ class DenseAMTDataset(Dataset):
                 str(self.target_config.onset_width_frames),
                 str(self.target_config.offset_width_frames),
                 str(self.target_config.min_note_seconds),
+                str(self.target_config.include_pedal),
+                str(self.target_config.include_duration),
+                str(self.target_config.max_duration_seconds),
             ]
         )
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
@@ -114,6 +120,11 @@ class DenseAMTCollator:
             "onset_mask": torch.zeros(len(batch), max_target_frames, 88),
             "meta": [item["meta"] for item in batch],
         }
+        if any("pedal" in item for item in batch):
+            out["pedal"] = torch.zeros(len(batch), max_target_frames, 1)
+        if any("duration" in item for item in batch):
+            out["duration"] = torch.zeros(len(batch), max_target_frames, 88)
+            out["duration_mask"] = torch.zeros(len(batch), max_target_frames, 88)
         for i, item in enumerate(batch):
             feat = item["features"]
             target_len = item["onset"].shape[0]
@@ -121,4 +132,9 @@ class DenseAMTCollator:
             out["valid_mask"][i, :target_len] = item["valid_mask"]
             for key in ("onset", "frame", "offset", "velocity", "onset_mask"):
                 out[key][i, :target_len] = item[key]
+            if "pedal" in out and "pedal" in item:
+                out["pedal"][i, :target_len] = item["pedal"]
+            if "duration" in out and "duration" in item:
+                out["duration"][i, :target_len] = item["duration"]
+                out["duration_mask"][i, :target_len] = item["duration_mask"]
         return out
