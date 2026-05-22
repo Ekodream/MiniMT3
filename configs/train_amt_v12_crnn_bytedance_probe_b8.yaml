@@ -1,0 +1,95 @@
+seed: 173
+train_manifest: data/cache/amt_train_4s_uniform192_v8.json
+val_manifest: data/cache/amt_val_4s_s8_v8.json
+train_split: train
+val_split: validation
+output_dir: outputs/ckpt_amt_v12_crnn_bytedance_probe_b8
+train_cache_dir: data/cache/amt_v12_probe_b8_train_4s_10ms_229mel
+val_cache_dir: data/cache/amt_v12_probe_b8_val_4s_10ms_229mel
+max_items: 64
+val_max_items: 8
+batch_size: 8
+eval_batch_size: 8
+num_workers: 2
+eval_workers: 1
+epochs: 1
+max_steps: 2
+lr: 0.00012
+min_lr: 0.00001
+warmup_steps: 2
+weight_decay: 0.0001
+betas: [0.9, 0.999]
+grad_clip: 3.0
+precision: bf16
+allow_tf32: true
+dist_timeout_minutes: 120
+prefetch_factor: 2
+log_interval: 1
+eval_interval: 2
+save_interval: 2
+debug_items: 0
+early_stop_min_steps: 0
+early_stop_patience_evals: 0
+audio:
+  sample_rate: 16000
+  n_mels: 229
+  n_fft: 2048
+  hop_length: 160
+  f_min: 30.0
+  f_max: 8000.0
+targets:
+  frame_strides: [1]
+  onset_width_frames: 0
+  offset_width_frames: 0
+  onset_soft_radius_frames: 2
+  offset_soft_radius_frames: 2
+  min_note_seconds: 0.02
+  include_pedal: true
+  include_duration: false
+  include_time_shifts: true
+  max_duration_seconds: 12.0
+  time_shift_clip_frames: 1.0
+model:
+  architecture: crnn_ensemble
+  n_mels: 229
+  predict_pedal: true
+  predict_duration: false
+  predict_time_shifts: true
+  acoustic_hidden: 768
+  acoustic_rnn_hidden: 256
+  acoustic_channels: [48, 64, 96, 128]
+loss:
+  onset_weight: 1.30
+  frame_weight: 0.58
+  offset_weight: 1.00
+  velocity_weight: 0.08
+  pedal_weight: 0.30
+  duration_weight: 0.0
+  onset_shift_weight: 0.16
+  offset_shift_weight: 0.14
+  onset_pos_weight: 9.0
+  frame_pos_weight: 2.0
+  offset_pos_weight: 8.0
+  pedal_pos_weight: 3.0
+  onset_neg_weight: 1.12
+  frame_neg_weight: 1.00
+  offset_neg_weight: 1.06
+  pedal_neg_weight: 1.0
+  onset_focal_gamma_pos: 0.0
+  onset_focal_gamma_neg: 0.6
+  frame_focal_gamma_pos: 0.0
+  frame_focal_gamma_neg: 0.4
+  offset_focal_gamma_pos: 0.0
+  offset_focal_gamma_neg: 0.4
+decode:
+  onset_threshold: 0.30
+  frame_threshold: 0.20
+  offset_threshold: 0.18
+  min_note_seconds: 0.045
+  max_notes_per_second: 40.0
+  max_polyphony: 12
+  min_onset_gap_seconds: 0.03
+  onset_peak_prominence: 0.01
+  max_notes_per_start_window: 10
+  start_window_seconds: 0.06
+  use_duration_head: false

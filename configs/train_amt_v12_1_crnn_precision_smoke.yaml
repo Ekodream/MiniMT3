@@ -1,0 +1,96 @@
+seed: 173
+train_manifest: data/cache/amt_train_4s_uniform192_v8.json
+val_manifest: data/cache/amt_val_4s_s8_v8.json
+train_split: train
+val_split: validation
+output_dir: outputs/ckpt_amt_v12_1_crnn_precision_smoke
+train_cache_dir: data/cache/amt_v12_1_smoke_train_4s_10ms_229mel
+val_cache_dir: data/cache/amt_v12_1_smoke_val_4s_10ms_229mel
+init_from: outputs/ckpt_amt_v12_crnn_bytedance/last.pt
+max_items: 16
+val_max_items: 8
+batch_size: 1
+eval_batch_size: 1
+num_workers: 0
+eval_workers: 0
+epochs: 1
+max_steps: 4
+lr: 0.000045
+min_lr: 0.000006
+warmup_steps: 2
+weight_decay: 0.0002
+betas: [0.9, 0.999]
+grad_clip: 2.0
+precision: bf16
+allow_tf32: true
+dist_timeout_minutes: 120
+prefetch_factor: 2
+log_interval: 1
+eval_interval: 2
+save_interval: 4
+debug_items: 4
+early_stop_min_steps: 0
+early_stop_patience_evals: 0
+audio:
+  sample_rate: 16000
+  n_mels: 229
+  n_fft: 2048
+  hop_length: 160
+  f_min: 30.0
+  f_max: 8000.0
+targets:
+  frame_strides: [1]
+  onset_width_frames: 0
+  offset_width_frames: 0
+  onset_soft_radius_frames: 2
+  offset_soft_radius_frames: 2
+  min_note_seconds: 0.02
+  include_pedal: true
+  include_duration: false
+  include_time_shifts: true
+  max_duration_seconds: 12.0
+  time_shift_clip_frames: 1.0
+model:
+  architecture: crnn_ensemble
+  n_mels: 229
+  predict_pedal: true
+  predict_duration: false
+  predict_time_shifts: true
+  acoustic_hidden: 768
+  acoustic_rnn_hidden: 256
+  acoustic_channels: [48, 64, 96, 128]
+loss:
+  onset_weight: 1.18
+  frame_weight: 0.54
+  offset_weight: 1.00
+  velocity_weight: 0.08
+  pedal_weight: 0.25
+  onset_shift_weight: 0.12
+  offset_shift_weight: 0.12
+  onset_mass_weight: 0.22
+  offset_mass_weight: 0.08
+  frame_mass_weight: 0.02
+  onset_pos_weight: 6.5
+  frame_pos_weight: 1.8
+  offset_pos_weight: 7.5
+  pedal_pos_weight: 2.5
+  onset_neg_weight: 1.45
+  frame_neg_weight: 1.08
+  offset_neg_weight: 1.12
+  pedal_neg_weight: 1.0
+decode:
+  onset_threshold: 0.42
+  frame_threshold: 0.20
+  offset_threshold: 0.24
+  min_note_seconds: 0.045
+  max_notes_per_second: 22.0
+  max_polyphony: 10
+  min_onset_gap_seconds: 0.035
+  disable_chord_recovery: true
+  onset_peak_prominence: 0.012
+  max_notes_per_start_window: 6
+  start_window_seconds: 0.05
+  use_duration_head: false
+  consume_note_energy: true
+  energy_neighbor_pitches: 1
+  energy_overlap_ratio: 0.45

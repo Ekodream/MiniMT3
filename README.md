@@ -142,6 +142,153 @@ Use v8 for new quality experiments. If it improves note F1 but remains underfitt
 raise `batch_size` and training steps first, then widen `d_model/head_hidden`; widening the backbone resets more weights
 and should be treated as a separate ablation.
 
+The first v8 run reached 6000 steps. It improved recall but over-generated with the training-time debug threshold
+(`onset_threshold=0.34`, pred/ref around 2.6-2.8). A fixed 48-clip threshold sweep showed a better demo/eval operating
+point around:
+
+```text
+onset_threshold=0.42
+frame_threshold=0.12
+offset_threshold=0.15
+pred_ref_ratio≈1.23
+note_f1≈0.30
+```
+
+`infer_amt.py` now automatically uses this more conservative onset threshold for v8-style 4s checkpoints unless an
+explicit `--onset_threshold` is passed.
+
+v8.1 precision fine-tuning is a follow-up for the over-generation seen in v8. It starts from the v8 best checkpoint,
+reduces the soft onset radius from 2 frames to 1 frame, strengthens negative onset/frame penalties, and raises the
+debug/default onset threshold to 0.42:
+
+```bash
+python scripts/train_amt.py --config configs/train_amt_v8_1_precision4_smoke.yaml
+torchrun --standalone --nproc_per_node=8 scripts/train_amt.py --config configs/train_amt_v8_1_precision4.yaml
+```
+
+Use this run when the priority is cleaner notes and less score clutter rather than maximum recall.
+
+v8.1 should be decoded less conservatively than its training debug default. A 48-clip sweep found that
+`onset_threshold=0.32` gives a better note-count balance than 0.42:
+
+```text
+v8.1 best, onset_threshold=0.32: note_f1≈0.313, pred_ref_ratio≈1.21
+```
+
+v9 capacity-plus tests whether the model is now capacity-limited without throwing away v8.1 weights. It keeps
+`d_model=256` and the existing heads, then adds four zero-gated Transformer adapter layers. Because the adapter gates
+start at zero, the initial model behaves like v8.1 and learns to use the extra capacity gradually:
+
+```bash
+python scripts/train_amt.py --config configs/train_amt_v9_capacity_plus_smoke.yaml
+torchrun --standalone --nproc_per_node=8 scripts/train_amt.py --config configs/train_amt_v9_capacity_plus.yaml
+```
+
+Only consider a true widened backbone, such as `d_model=384`, after v9 has been evaluated; that route discards many
+checkpoint weights and is closer to a new training run.
+
+v10 high-resolution shift is the next mainline after v9 showed that adapter capacity alone was not enough. The key
+change is ByteDance-style high-resolution timing: the dense AMT output is moved from roughly 40 ms to roughly 20 ms by
+changing the encoder strides from `[2, 2]` to `[2, 1]`, and the model adds onset/offset sub-frame shift regression
+heads. This keeps compatible v9 weights where shapes match while giving the decoder finer onset/offset placement:
+
+```bash
+python scripts/train_amt.py --config configs/train_amt_v10_hires20_shift_smoke.yaml
+torchrun --standalone --nproc_per_node=8 scripts/train_amt.py --config configs/train_amt_v10_hires20_shift.yaml
+```
+
+Use v10 when the priority is breaking the note-F1 ceiling. If v10 improves onset F1, the next capacity step is a true
+wide high-resolution model (`d_model/head_hidden` 320-384). If it does not, the bottleneck is likely target/data quality
+or decoding calibration rather than parameter count.
+
+The first v10 long run reached 9000 steps. It learned the shift heads and improved offset quality, but did not break the
+note-F1 ceiling:
+
+```text
+v10 best step≈4500: debug note_f1≈0.291, offset_f1≈0.118, pred/ref≈1.32
+v10 step 9000:      debug note_f1≈0.300, offset_f1≈0.133, pred/ref≈1.63
+48-clip sweep:      best note_f1≈0.301 at onset=0.34, frame=0.16, offset=0.12
+```
+
+v11 high-resolution wide is the follow-up when v10 plateaus. It widens the model to `d_model=384/head_hidden=384`,
+keeps the high-resolution `[2, 1]` strides and shift regression, and uses expanded initialization from v10: matching
+sub-blocks are copied into the wider tensors while new dimensions start at zero. This avoids restarting from scratch
+while giving the model more acoustic capacity:
+
+```bash
+python scripts/train_amt.py --config configs/train_amt_v11_hires20_wide384_smoke.yaml
+torchrun --standalone --nproc_per_node=8 scripts/train_amt.py --config configs/train_amt_v11_hires20_wide384.yaml
+```
+
+v11 also enables debug-score early stopping so long runs do not keep training after the best checkpoint has clearly
+stalled. This is important because v8-v10 often kept lowering loss while pred/ref drifted upward.
+
+The completed v11 run confirms that simply widening the existing Transformer-style dense AMT model is not enough:
+
+```text
+v11 best score: step=1200, debug note_f1≈0.259, offset_f1≈0.092, pred/ref≈1.18
+v11 step=2700:  debug note_f1≈0.286, offset_f1≈0.107, pred/ref≈1.51
+v11 step=3600:  debug note_f1≈0.267, offset_f1≈0.104, pred/ref≈1.48, early-stopped
+```
+
+v12 is therefore a larger architectural change, not another threshold sweep. It follows the practical direction of
+high-resolution piano transcription systems: 10 ms-ish features, independent CRNN towers for onset/frame/offset/
+velocity/pedal, onset-conditioned frame prediction, and sub-frame onset/offset shift regression. The goal is to move
+the bottleneck from "shared small encoder cannot separate boundaries" to supervised acoustic boundary detection:
+
+```bash
+python scripts/train_amt.py --config configs/train_amt_v12_crnn_bytedance_smoke.yaml
+torchrun --standalone --nproc_per_node=8 scripts/train_amt.py --config configs/train_amt_v12_crnn_bytedance.yaml
+```
+
+If v12 still plateaus far below `note_f1=0.5`, the next correct step is not more decode tuning. Inspect target alignment,
+audio/MIDI synchronization, and manifest difficulty; then increase data scale and training duration with this
+high-resolution multi-head architecture.
+
+The first v12 run showed that the model was much better than the original debug threshold suggested. Low-threshold debug
+at step 6000 over-generated (`pred/ref≈2.86`), but a fixed 32-clip sweep with energy-consumption decoding gave:
+
+```text
+v12 last.pt + consume_note_energy:
+  best global thresholds: onset=0.42, frame=0.20, offset=0.24
+  note_f1≈0.626, offset_f1≈0.250, pred/ref≈0.94
+```
+
+This means the main failure was decode calibration and duplicate/echo notes, not pure model capacity. The current main
+demo/eval path should use `consume_note_energy=true`. A too-strong precision fine-tune (`v12.1`) quickly became
+under-generating, so `v12.2` uses a much lighter mass regularizer and keeps the calibrated lower onset threshold:
+
+```bash
+torchrun --standalone --nproc_per_node=8 scripts/train_amt.py --config configs/train_amt_v12_2_crnn_calibrated.yaml
+```
+
+v13-wide is the next main quality push. It does not keep polishing v12 thresholds indefinitely: v12 is used as a
+calibrated baseline and as expanded initialization, then v13 increases CRNN capacity and trains on 8s windows with the
+center 6s supervised. This gives the model more left/right context for chords, long notes, pedal/legato, and window
+boundary continuity while keeping 10 ms high-resolution targets.
+
+Build the v13 manifests, smoke, and launch the 8-GPU run on the remote machine:
+
+```bash
+bash scripts/remote_start_v13_wide.sh
+```
+
+Equivalent manual commands:
+
+```bash
+python scripts/build_amt_manifest.py --index data/cache/maestro_index.json --split train \
+  --out data/cache/amt_train_8s_uniform2048_v13.json --clip_seconds 8 \
+  --sampling uniform --max_clips 2048 --max_clips_per_piece 8 --seed 173
+python scripts/build_amt_manifest.py --index data/cache/maestro_index.json --split validation \
+  --out data/cache/amt_val_8s_s8_v13.json --clip_seconds 8 --stride_seconds 8 --max_clips 128
+python scripts/train_amt.py --config configs/train_amt_v13_wide_smoke.yaml
+torchrun --standalone --nproc_per_node=8 scripts/train_amt.py --config configs/train_amt_v13_wide.yaml
+```
+
+v13 default decoding uses Onsets-and-Frames style onset gating, Basic-Pitch-style frame-diff onset recovery, and
+energy-consumption duplicate suppression. For v12 checkpoints, `infer_amt.py` now defaults to the calibrated profile
+(`onset=0.42, frame=0.20, offset=0.24, consume_note_energy=true`) unless explicit CLI thresholds are passed.
+
 v5.4 ScorePolish is an inference/post-processing layer rather than a new architecture checkpoint. It separates
 performance MIDI from readable score export, prunes pedal-resonance long notes from the score path, estimates
 key/tempo, quantizes to a beat grid, uses dynamic-programming hand assignment, trims overlapping score durations per
@@ -170,12 +317,17 @@ python scripts/infer_amt.py \
 Useful display controls:
 
 ```bash
+--window_seconds 4.0              # match v8's 4s training context
+--overlap_seconds 0.75            # reduce window-boundary chord/long-note damage
 --score_max_notes_per_beat 8      # lower for cleaner scores, higher for dense passages
 --score_max_overlap_beats 0.0     # keep score durations from overlapping the next hand event
 --disable_score_overlap_trim      # keep longer notated durations for ablation
 --time_signature 12/8             # useful for compound-meter pieces such as Merry Christmas Mr. Lawrence
 --score_beat_divisions 2,4        # suppress triplet clutter; add 3 only for real tuplets
 --score_max_short_rest_beats 0.75 # fill tiny score gaps by extending notes to the next onset
+--disable_score_start_align       # keep true opening rests/pickups instead of trimming leading silence
+--score_start_offset_beats 1.0    # manually remove a known pickup/leading offset from the score view
+--score_chord_snap_seconds 0.075  # align near-simultaneous chord tones without collapsing arpeggios
 --disable_score_key_filter        # ablation: keep weak chromatic/non-key notes
 ```
 

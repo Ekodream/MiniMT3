@@ -12,7 +12,7 @@ from minimt3.amt.model import DenseAMT, DenseAMTConfig
 from minimt3.amt.targets import DenseTargetConfig
 from minimt3.audio.features import LogMelConfig
 from minimt3.symbolic.events import NoteEvent, load_midi_events
-from minimt3.utils import read_yaml
+from minimt3.utils import read_yaml, write_json
 
 
 def main() -> None:
@@ -42,6 +42,14 @@ def main() -> None:
     parser.add_argument("--disable_duration_head", action="store_true")
     parser.add_argument("--max_duration_seconds", type=float)
     parser.add_argument("--duration_extension_weight", type=float)
+    parser.add_argument("--consume_note_energy", action="store_true")
+    parser.add_argument("--energy_neighbor_pitches", type=int)
+    parser.add_argument("--energy_overlap_ratio", type=float)
+    parser.add_argument("--infer_onsets_from_frame_diff", action="store_true")
+    parser.add_argument("--frame_diff_n", type=int)
+    parser.add_argument("--frame_diff_scale", type=float)
+    parser.add_argument("--eval_center_only", action="store_true")
+    parser.add_argument("--json_out")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -50,13 +58,14 @@ def main() -> None:
     model = DenseAMT(DenseAMTConfig(**cfg.get("model", {}))).to(device)
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
+    target_config = DenseTargetConfig(**cfg.get("targets", {}))
     dataset = DenseAMTDataset(
         args.manifest,
         feature_config=LogMelConfig(**cfg.get("audio", {})),
         split=args.split,
         max_items=args.items,
         cache_dir=args.cache_dir,
-        target_config=DenseTargetConfig(**cfg.get("targets", {})),
+        target_config=target_config,
     )
     combos = [
         (onset_t, frame_t, offset_t)
@@ -122,7 +131,27 @@ def main() -> None:
         if args.duration_extension_weight is not None
         else decode_cfg.get("duration_extension_weight", 1.0)
     )
+    consume_note_energy = bool(args.consume_note_energy or decode_cfg.get("consume_note_energy", False))
+    energy_neighbor_pitches = int(
+        args.energy_neighbor_pitches
+        if args.energy_neighbor_pitches is not None
+        else decode_cfg.get("energy_neighbor_pitches", 1)
+    )
+    energy_overlap_ratio = float(
+        args.energy_overlap_ratio
+        if args.energy_overlap_ratio is not None
+        else decode_cfg.get("energy_overlap_ratio", 0.5)
+    )
+    infer_onsets_from_frame_diff = bool(
+        args.infer_onsets_from_frame_diff or decode_cfg.get("infer_onsets_from_frame_diff", False)
+    )
+    frame_diff_n = int(args.frame_diff_n if args.frame_diff_n is not None else decode_cfg.get("frame_diff_n", 2))
+    frame_diff_scale = float(
+        args.frame_diff_scale if args.frame_diff_scale is not None else decode_cfg.get("frame_diff_scale", 1.0)
+    )
+    eval_center_only = bool(args.eval_center_only or decode_cfg.get("eval_center_only", False))
     totals = {combo: {"note_f1": 0.0, "offset_f1": 0.0, "pred": 0, "ref": 0} for combo in combos}
+    item_records = []
     with torch.no_grad():
         for idx in range(len(dataset)):
             sample = dataset[idx]
@@ -153,15 +182,43 @@ def main() -> None:
                     use_duration_head=not args.disable_duration_head,
                     max_duration_seconds=max_duration_seconds,
                     duration_extension_weight=duration_extension_weight,
+                    time_shift_clip_frames=float(target_config.time_shift_clip_frames),
+                    consume_note_energy=consume_note_energy,
+                    energy_neighbor_pitches=energy_neighbor_pitches,
+                    energy_overlap_ratio=energy_overlap_ratio,
+                    infer_onsets_from_frame_diff=infer_onsets_from_frame_diff,
+                    frame_diff_n=frame_diff_n,
+                    frame_diff_scale=frame_diff_scale,
                 )
-                metric = note_metrics(notes, ref_notes)
+                eval_notes, eval_ref_notes = _maybe_center_crop_notes(
+                    notes,
+                    ref_notes,
+                    duration,
+                    float(target_config.supervision_margin_seconds),
+                    eval_center_only,
+                )
+                metric = note_metrics(eval_notes, eval_ref_notes)
                 totals[combo]["note_f1"] += metric["note_f1"]
                 totals[combo]["offset_f1"] += metric["offset_f1"]
-                totals[combo]["pred"] += len(notes)
-                totals[combo]["ref"] += len(ref_notes)
-                cand = (metric["note_f1"], metric["offset_f1"], len(notes), combo)
+                totals[combo]["pred"] += len(eval_notes)
+                totals[combo]["ref"] += len(eval_ref_notes)
+                cand = (metric["note_f1"], metric["offset_f1"], len(eval_notes), combo)
                 if best is None or cand > best:
                     best = cand
+            item_records.append(
+                {
+                    "index": idx,
+                    "clip_id": row.get("clip_id", idx),
+                    "best_note_f1": best[0],
+                    "best_offset_f1": best[1],
+                    "pred_notes": best[2],
+                    "thresholds": best[3],
+                    "ref_notes": len(ref_notes),
+                    "duration": duration,
+                    "audio": row.get("audio"),
+                    "midi": row.get("midi"),
+                }
+            )
             print(
                 "amt_item "
                 f"index={idx} clip_id={row.get('clip_id', idx)} "
@@ -189,6 +246,18 @@ def main() -> None:
             best_score = score
             best_combo = combo
     print(f"amt_best thresholds={best_combo} score={best_score:.4f}", flush=True)
+    if args.json_out:
+        write_json(
+            args.json_out,
+            {
+                "best_thresholds": best_combo,
+                "best_score": best_score,
+                "items": item_records,
+                "consume_note_energy": consume_note_energy,
+                "infer_onsets_from_frame_diff": infer_onsets_from_frame_diff,
+                "eval_center_only": eval_center_only,
+            },
+        )
 
 
 def _floats(value: str) -> list[float]:
@@ -202,6 +271,23 @@ def selection_score(note_f1: float, offset_f1: float, pred_ref_ratio: float) -> 
     over_generation = max(0.0, pred_ref_ratio - 1.35)
     under_generation = max(0.0, 0.55 - pred_ref_ratio)
     return 10.0 * note_f1 + offset_f1 - 1.15 * ratio_error - 0.65 * over_generation - 0.35 * under_generation
+
+
+def _maybe_center_crop_notes(
+    pred_notes: list[NoteEvent],
+    ref_notes: list[NoteEvent],
+    duration: float,
+    margin: float,
+    enabled: bool,
+) -> tuple[list[NoteEvent], list[NoteEvent]]:
+    if not enabled or margin <= 0.0 or duration <= margin * 2.0:
+        return pred_notes, ref_notes
+    lo = margin
+    hi = duration - margin
+    return (
+        [note for note in pred_notes if lo <= note.start < hi],
+        [note for note in ref_notes if lo <= note.start < hi],
+    )
 
 
 def note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dict[str, float]:

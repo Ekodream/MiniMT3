@@ -88,7 +88,13 @@ def main() -> None:
     model_cfg = DenseAMTConfig(**cfg.get("model", {}))
     model = DenseAMT(model_cfg).to(device)
     if cfg.get("init_from"):
-        load_compatible_weights(cfg["init_from"], model, device, rank)
+        load_compatible_weights(
+            cfg["init_from"],
+            model,
+            device,
+            rank,
+            expand=bool(cfg.get("init_expand", False)),
+        )
     if is_ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     loss_cfg = cfg.get("loss", {})
@@ -114,6 +120,7 @@ def main() -> None:
 
     out_dir = ensure_dir(cfg.get("output_dir", "outputs/ckpt_amt_v5"))
     best_score = -math.inf
+    best_step = 0
     global_step = 0
     epochs = int(cfg.get("epochs", 100))
     log_interval = int(cfg.get("log_interval", 20))
@@ -157,14 +164,35 @@ def main() -> None:
                     debug = debug_decode(eval_model, val_ds, device, cfg, global_step)
                     score = selection_score(debug)
                     print(f"checkpoint_selection score={score:.5f} best={best_score:.5f}", flush=True)
-                    if score > best_score:
+                    min_delta = float(cfg.get("early_stop_min_delta", 1e-5))
+                    improved = score > best_score + min_delta
+                    if improved:
                         best_score = score
+                        best_step = global_step
                         save_checkpoint(out_dir / "best.pt", eval_model, cfg, global_step, best_score)
                     if global_step % int(cfg.get("save_interval", 300)) == 0:
                         save_checkpoint(out_dir / f"step_{global_step}.pt", eval_model, cfg, global_step, score)
+                    patience_evals = int(cfg.get("early_stop_patience_evals", 0) or 0)
+                    early_stop_min_steps = int(cfg.get("early_stop_min_steps", 0) or 0)
+                    if (
+                        patience_evals > 0
+                        and best_step > 0
+                        and global_step >= early_stop_min_steps
+                        and global_step - best_step >= patience_evals * eval_interval
+                    ):
+                        print(
+                            "early_stop "
+                            f"step={global_step} best_step={best_step} "
+                            f"patience_evals={patience_evals}",
+                            flush=True,
+                        )
+                        stop_tensor.fill_(1)
                 if is_ddp:
                     dist.broadcast(stop_tensor, src=0)
                     dist.barrier()
+                if int(stop_tensor.item()) != 0:
+                    global_step = max_steps if max_steps else global_step
+                    break
     if rank == 0:
         eval_model = model.module if hasattr(model, "module") else model
         save_checkpoint(out_dir / "last.pt", eval_model, cfg, global_step, best_score)
@@ -238,13 +266,24 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
             use_duration_head=bool(decode_cfg.get("use_duration_head", True)),
             max_duration_seconds=float(decode_cfg.get("max_duration_seconds", 8.0)),
             duration_extension_weight=float(decode_cfg.get("duration_extension_weight", 1.0)),
+            time_shift_clip_frames=float(cfg.get("targets", {}).get("time_shift_clip_frames", 1.0)),
+            consume_note_energy=bool(decode_cfg.get("consume_note_energy", False)),
+            energy_neighbor_pitches=int(decode_cfg.get("energy_neighbor_pitches", 1)),
+            energy_overlap_ratio=float(decode_cfg.get("energy_overlap_ratio", 0.5)),
+            infer_onsets_from_frame_diff=bool(decode_cfg.get("infer_onsets_from_frame_diff", False)),
+            frame_diff_n=int(decode_cfg.get("frame_diff_n", 2)),
+            frame_diff_scale=float(decode_cfg.get("frame_diff_scale", 1.0)),
         )
         ref_notes, _ = load_midi_events(row["midi"], start=float(row["start_sec"]), end=float(row["end_sec"]))
+        notes, ref_notes = _maybe_center_crop_notes(notes, ref_notes, row, cfg)
         metric = note_metrics(notes, ref_notes)
         totals["note_f1"] += metric["note_f1"]
         totals["offset_f1"] += metric["offset_f1"]
         totals["pred"] += len(notes)
         totals["ref"] += len(ref_notes)
+        totals.setdefault("bad_clips", 0)
+        if metric["note_f1"] < float(cfg.get("bad_clip_f1_threshold", 0.05)):
+            totals["bad_clips"] += 1
         print(
             "debug_amt "
             f"step={step} item={idx} clip_id={row.get('clip_id', idx)} "
@@ -258,11 +297,13 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
         "note_f1": totals["note_f1"] / count,
         "offset_f1": totals["offset_f1"] / count,
         "pred_ref_ratio": pred_ref,
+        "bad_clip_rate": totals.get("bad_clips", 0) / count,
     }
     print(
         "debug_amt_summary "
         f"step={step} note_f1={summary['note_f1']:.4f} offset_f1={summary['offset_f1']:.4f} "
-        f"pred_ref_ratio={pred_ref:.3f} pred_notes={totals['pred']} ref_notes={totals['ref']}",
+        f"pred_ref_ratio={pred_ref:.3f} bad_clip_rate={summary['bad_clip_rate']:.3f} "
+        f"pred_notes={totals['pred']} ref_notes={totals['ref']}",
         flush=True,
     )
     if was_training:
@@ -283,6 +324,7 @@ def selection_score(debug: dict[str, float]) -> float:
         - 1.15 * ratio_error
         - 0.65 * over_generation
         - 0.35 * under_generation
+        - 1.0 * float(debug.get("bad_clip_rate", 0.0))
     )
 
 
@@ -320,6 +362,27 @@ def note_arrays(notes: list[NoteEvent], np_module):
     )
 
 
+def _maybe_center_crop_notes(
+    pred_notes: list[NoteEvent],
+    ref_notes: list[NoteEvent],
+    row: dict[str, Any],
+    cfg: dict[str, Any],
+) -> tuple[list[NoteEvent], list[NoteEvent]]:
+    margin = float(cfg.get("targets", {}).get("supervision_margin_seconds", 0.0) or 0.0)
+    if margin <= 0.0 or not bool(cfg.get("decode", {}).get("eval_center_only", False)):
+        return pred_notes, ref_notes
+    duration = float(row.get("end_sec", 0.0)) - float(row.get("start_sec", 0.0))
+    if duration <= margin * 2.0:
+        return pred_notes, ref_notes
+    lo = margin
+    hi = duration - margin
+
+    def keep(note: NoteEvent) -> bool:
+        return lo <= note.start < hi
+
+    return [note for note in pred_notes if keep(note)], [note for note in ref_notes if keep(note)]
+
+
 def simple_note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dict[str, float]:
     matched = set()
     hits = 0
@@ -335,16 +398,89 @@ def simple_note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent])
     return {"note_f1": f1, "offset_f1": 0.0}
 
 
-def load_compatible_weights(path, model: DenseAMT, device, rank: int) -> None:
+def load_compatible_weights(path, model: DenseAMT, device, rank: int, expand: bool = False) -> None:
     ckpt = torch.load(path, map_location=device)
     source = ckpt.get("model", ckpt)
     current = model.state_dict()
     compatible = {k: v for k, v in source.items() if k in current and current[k].shape == v.shape}
+    expanded: dict[str, torch.Tensor] = {}
+    if expand:
+        for key, source_value in source.items():
+            if key not in current or key in compatible:
+                continue
+            target_value = current[key]
+            if not torch.is_floating_point(source_value) or not torch.is_floating_point(target_value):
+                continue
+            if source_value.ndim != target_value.ndim:
+                continue
+            expanded_value = _expanded_initial_value(target_value, key)
+            _copy_expanded_tensor(expanded_value, source_value, key)
+            expanded[key] = expanded_value
+        compatible.update(expanded)
     incompatible = model.load_state_dict(compatible, strict=False)
     if rank == 0:
-        print(f"initialized compatible AMT weights from {path} keys={len(compatible)}", flush=True)
+        print(
+            f"initialized compatible AMT weights from {path} "
+            f"keys={len(compatible)} expanded={len(expanded)}",
+            flush=True,
+        )
         if incompatible.missing_keys:
             print(f"init_missing_keys={incompatible.missing_keys[:20]}", flush=True)
+
+
+def _copy_expanded_tensor(target: torch.Tensor, source: torch.Tensor, key: str) -> None:
+    """Copy source weights into the overlapping subspace of a wider target tensor."""
+    if "in_proj_weight" in key and target.ndim == 2 and source.ndim == 2:
+        _copy_qkv_rows(target, source)
+        return
+    if "in_proj_bias" in key and target.ndim == 1 and source.ndim == 1:
+        _copy_qkv_rows(target.unsqueeze(1), source.unsqueeze(1))
+        return
+    if _is_gru_gate_tensor(key, target, source):
+        _copy_gru_gates(target, source)
+        return
+    slices = tuple(slice(0, min(t, s)) for t, s in zip(target.shape, source.shape))
+    target[slices].copy_(source[slices])
+
+
+def _expanded_initial_value(target: torch.Tensor, key: str) -> torch.Tensor:
+    if target.ndim == 1 and key.endswith("weight") and any(part in key.lower() for part in ("norm", "layernorm")):
+        return target.clone()
+    return torch.zeros_like(target)
+
+
+def _copy_qkv_rows(target: torch.Tensor, source: torch.Tensor) -> None:
+    target_rows = target.shape[0] // 3
+    source_rows = source.shape[0] // 3
+    cols = min(target.shape[1], source.shape[1])
+    rows = min(target_rows, source_rows)
+    for idx in range(3):
+        target[idx * target_rows : idx * target_rows + rows, :cols].copy_(
+            source[idx * source_rows : idx * source_rows + rows, :cols]
+        )
+
+
+def _is_gru_gate_tensor(key: str, target: torch.Tensor, source: torch.Tensor) -> bool:
+    if not any(part in key for part in ("weight_ih", "weight_hh", "bias_ih", "bias_hh")):
+        return False
+    return target.ndim in {1, 2} and source.ndim == target.ndim and target.shape[0] % 3 == 0 and source.shape[0] % 3 == 0
+
+
+def _copy_gru_gates(target: torch.Tensor, source: torch.Tensor) -> None:
+    target_rows = target.shape[0] // 3
+    source_rows = source.shape[0] // 3
+    rows = min(target_rows, source_rows)
+    if target.ndim == 1:
+        for idx in range(3):
+            target[idx * target_rows : idx * target_rows + rows].copy_(
+                source[idx * source_rows : idx * source_rows + rows]
+            )
+    else:
+        cols = min(target.shape[1], source.shape[1])
+        for idx in range(3):
+            target[idx * target_rows : idx * target_rows + rows, :cols].copy_(
+                source[idx * source_rows : idx * source_rows + rows, :cols]
+            )
 
 
 def save_checkpoint(path: str | Path, model: DenseAMT, cfg: dict[str, Any], step: int, score: float) -> None:

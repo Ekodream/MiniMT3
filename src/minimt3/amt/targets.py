@@ -20,12 +20,19 @@ class DenseTargetConfig:
     min_note_seconds: float = 0.02
     include_pedal: bool = False
     include_duration: bool = False
+    include_time_shifts: bool = False
     max_duration_seconds: float = 8.0
+    frame_strides: tuple[int, int] | list[int] = (2, 2)
+    time_shift_clip_frames: float = 1.0
+    supervision_margin_seconds: float = 0.0
 
 
-def encoder_frame_count(feature_frames: int) -> int:
-    first = (int(feature_frames) + 1) // 2
-    return max(1, (first + 1) // 2)
+def encoder_frame_count(feature_frames: int, strides: tuple[int, ...] | list[int] = (2, 2)) -> int:
+    frames = int(feature_frames)
+    for stride in strides:
+        stride = max(1, int(stride))
+        frames = (frames + stride - 1) // stride
+    return max(1, frames)
 
 
 def build_dense_targets(
@@ -45,6 +52,10 @@ def build_dense_targets(
     onset_mask = torch.zeros(frames, NUM_PITCHES)
     note_duration = torch.zeros(frames, NUM_PITCHES) if cfg.include_duration else None
     duration_mask = torch.zeros(frames, NUM_PITCHES) if cfg.include_duration else None
+    onset_shift = torch.zeros(frames, NUM_PITCHES) if cfg.include_time_shifts else None
+    onset_shift_mask = torch.zeros(frames, NUM_PITCHES) if cfg.include_time_shifts else None
+    offset_shift = torch.zeros(frames, NUM_PITCHES) if cfg.include_time_shifts else None
+    offset_shift_mask = torch.zeros(frames, NUM_PITCHES) if cfg.include_time_shifts else None
 
     for note in notes:
         _write_note(
@@ -59,6 +70,10 @@ def build_dense_targets(
             write_onset=True,
             note_duration=note_duration,
             duration_mask=duration_mask,
+            onset_shift=onset_shift,
+            onset_shift_mask=onset_shift_mask,
+            offset_shift=offset_shift,
+            offset_shift_mask=offset_shift_mask,
         )
     for note in tie_notes:
         _write_note(
@@ -73,6 +88,10 @@ def build_dense_targets(
             write_onset=False,
             note_duration=note_duration,
             duration_mask=duration_mask,
+            onset_shift=onset_shift,
+            onset_shift_mask=onset_shift_mask,
+            offset_shift=offset_shift,
+            offset_shift_mask=offset_shift_mask,
         )
     targets = {
         "onset": onset,
@@ -84,6 +103,16 @@ def build_dense_targets(
     if note_duration is not None and duration_mask is not None:
         targets["duration"] = note_duration
         targets["duration_mask"] = duration_mask
+    if (
+        onset_shift is not None
+        and onset_shift_mask is not None
+        and offset_shift is not None
+        and offset_shift_mask is not None
+    ):
+        targets["onset_shift"] = onset_shift
+        targets["onset_shift_mask"] = onset_shift_mask
+        targets["offset_shift"] = offset_shift
+        targets["offset_shift_mask"] = offset_shift_mask
     if cfg.include_pedal:
         pedal = torch.zeros(frames, 1)
         for item in pedals:
@@ -106,6 +135,10 @@ def _write_note(
     write_onset: bool,
     note_duration: torch.Tensor | None = None,
     duration_mask: torch.Tensor | None = None,
+    onset_shift: torch.Tensor | None = None,
+    onset_shift_mask: torch.Tensor | None = None,
+    offset_shift: torch.Tensor | None = None,
+    offset_shift_mask: torch.Tensor | None = None,
 ) -> None:
     if not (PITCH_MIN <= int(note.pitch) <= PITCH_MAX):
         return
@@ -118,6 +151,7 @@ def _write_note(
     end_idx = min(frames, end_idx)
     frame[start_idx:end_idx, pitch_idx] = 1.0
     if write_onset:
+        onset_center = _time_to_frame_float(note.start, duration, frames)
         onset_indices = _write_boundary_target(
             onset,
             start_idx,
@@ -128,20 +162,34 @@ def _write_note(
         for idx in onset_indices:
             onset_mask[idx, pitch_idx] = 1.0
             velocity[idx, pitch_idx] = max(1, min(127, int(note.velocity))) / 127.0
+            if onset_shift is not None and onset_shift_mask is not None:
+                onset_shift[idx, pitch_idx] = _clip_shift(
+                    onset_center - idx,
+                    cfg.time_shift_clip_frames,
+                )
+                onset_shift_mask[idx, pitch_idx] = 1.0
         if note_duration is not None and duration_mask is not None:
             normalized = _duration_to_unit(note.end - note.start, cfg.max_duration_seconds)
             for idx in onset_indices:
                 note_duration[idx, pitch_idx] = normalized
                 duration_mask[idx, pitch_idx] = 1.0
     if note.end < duration - 1e-4:
-        offset_idx = min(frames - 1, max(0, end_idx - 1))
-        _write_boundary_target(
+        offset_center = _time_to_frame_float(note.end, duration, frames)
+        offset_idx = min(frames - 1, max(0, int(offset_center)))
+        offset_indices = _write_boundary_target(
             offset,
             offset_idx,
             pitch_idx,
             hard_width_frames=cfg.offset_width_frames,
             soft_radius_frames=cfg.offset_soft_radius_frames,
         )
+        if offset_shift is not None and offset_shift_mask is not None:
+            for idx in offset_indices:
+                offset_shift[idx, pitch_idx] = _clip_shift(
+                    offset_center - idx,
+                    cfg.time_shift_clip_frames,
+                )
+                offset_shift_mask[idx, pitch_idx] = 1.0
 
 
 def _write_boundary_target(
@@ -174,6 +222,16 @@ def _time_to_frame(seconds: float, duration: float, frames: int, end: bool = Fal
     raw = pos * frames
     idx = int(math.ceil(raw)) if end else int(raw)
     return min(frames - 1 if not end else frames, max(0, idx))
+
+
+def _time_to_frame_float(seconds: float, duration: float, frames: int) -> float:
+    pos = max(0.0, min(1.0, float(seconds) / max(1e-6, duration)))
+    return max(0.0, min(float(frames - 1), pos * frames))
+
+
+def _clip_shift(value: float, clip: float) -> float:
+    clip = max(0.05, float(clip))
+    return max(-clip, min(clip, float(value))) / clip
 
 
 def _duration_to_unit(seconds: float, max_duration_seconds: float) -> float:

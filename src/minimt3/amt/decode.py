@@ -29,6 +29,13 @@ def decode_dense_notes(
     use_duration_head: bool = True,
     max_duration_seconds: float = 8.0,
     duration_extension_weight: float = 1.0,
+    time_shift_clip_frames: float = 1.0,
+    consume_note_energy: bool = False,
+    energy_neighbor_pitches: int = 1,
+    energy_overlap_ratio: float = 0.50,
+    infer_onsets_from_frame_diff: bool = False,
+    frame_diff_n: int = 2,
+    frame_diff_scale: float = 1.0,
 ) -> list[NoteEvent]:
     onset = torch.sigmoid(outputs["onset_logits"])[0].detach().cpu()
     frame = torch.sigmoid(outputs["frame_logits"])[0].detach().cpu()
@@ -37,10 +44,21 @@ def decode_dense_notes(
     duration_pred = None
     if use_duration_head and "duration_logits" in outputs:
         duration_pred = torch.sigmoid(outputs["duration_logits"])[0].detach().cpu()
+    onset_shift = None
+    offset_shift = None
+    if "onset_shift_logits" in outputs:
+        onset_shift = torch.tanh(outputs["onset_shift_logits"])[0].detach().cpu()
+    if "offset_shift_logits" in outputs:
+        offset_shift = torch.tanh(outputs["offset_shift_logits"])[0].detach().cpu()
     onset_for_peaks = onset
     if onset_frame_fusion_weight > 0.0:
         weight = max(0.0, min(1.0, float(onset_frame_fusion_weight)))
         onset_for_peaks = torch.maximum(onset, (1.0 - weight) * onset + weight * frame)
+    if infer_onsets_from_frame_diff:
+        onset_for_peaks = torch.maximum(
+            onset_for_peaks,
+            _inferred_onsets_from_frame_diff(onset_for_peaks, frame, n_diff=int(frame_diff_n), scale=float(frame_diff_scale)),
+        )
     frames, pitches = onset.shape
     frame_seconds = float(duration) / max(1, frames)
     min_frames = max(1, int(round(min_note_seconds / max(1e-6, frame_seconds))))
@@ -101,9 +119,9 @@ def decode_dense_notes(
         frame_counts[start_idx] = frame_counts.get(start_idx, 0) + 1
         pitch_starts.setdefault(pitch_idx, []).append(start_idx)
 
-    notes: list[NoteEvent] = []
+    note_items: list[tuple[float, NoteEvent]] = []
     for _, start_idx, pitch_idx in selected:
-        end_idx = _find_note_end(
+        end_idx, offset_idx = _find_note_end(
             frame[:, pitch_idx],
             offset[:, pitch_idx],
             start_idx,
@@ -111,11 +129,20 @@ def decode_dense_notes(
             frame_threshold=frame_threshold,
             offset_threshold=offset_threshold,
         )
+        start_shift_frames = 0.0
+        if onset_shift is not None:
+            start_shift_frames = float(onset_shift[start_idx, pitch_idx]) * float(time_shift_clip_frames)
+        start_seconds = (start_idx + start_shift_frames) * frame_seconds
+        start_seconds = max(0.0, min(float(duration), start_seconds))
         frame_end = max((start_idx + min_frames) * frame_seconds, end_idx * frame_seconds)
+        if offset_shift is not None and offset_idx is not None:
+            offset_shift_frames = float(offset_shift[offset_idx, pitch_idx]) * float(time_shift_clip_frames)
+            shifted_offset = (offset_idx + offset_shift_frames) * frame_seconds
+            frame_end = max((start_idx + min_frames) * frame_seconds, shifted_offset)
         end_seconds = frame_end
         if duration_pred is not None:
             predicted = _unit_to_duration(float(duration_pred[start_idx, pitch_idx]), max_duration_seconds)
-            duration_end = start_idx * frame_seconds + predicted
+            duration_end = start_seconds + predicted
             if duration_extension_weight >= 1.0:
                 end_seconds = max(frame_end, duration_end)
             elif duration_extension_weight > 0.0:
@@ -124,14 +151,26 @@ def decode_dense_notes(
                     frame_end * (1.0 - duration_extension_weight) + duration_end * duration_extension_weight,
                 )
         vel = int(round(float(velocity[start_idx, pitch_idx]) * 127))
-        notes.append(
-            NoteEvent(
+        end_seconds = max(start_seconds + min_note_seconds, min(float(duration), end_seconds))
+        note_items.append(
+            (
+                float(onset_for_peaks[start_idx, pitch_idx]),
+                NoteEvent(
                 pitch=PITCH_MIN + pitch_idx,
-                start=start_idx * frame_seconds,
+                start=start_seconds,
                 end=end_seconds,
                 velocity=max(1, min(127, vel)),
+                ),
             )
         )
+    if consume_note_energy:
+        notes = _consume_duplicate_energy(
+            note_items,
+            neighbor_pitches=int(energy_neighbor_pitches),
+            overlap_ratio=float(energy_overlap_ratio),
+        )
+    else:
+        notes = [note for _, note in note_items]
     notes.sort(key=lambda n: (n.start, -n.velocity, n.pitch))
     return notes
 
@@ -153,6 +192,28 @@ def _onset_peaks(values: torch.Tensor, threshold: float, prominence: float = 0.0
     return peaks
 
 
+def _inferred_onsets_from_frame_diff(
+    onsets: torch.Tensor,
+    frames: torch.Tensor,
+    n_diff: int = 2,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """Infer onset-like peaks from rapid frame-energy increases."""
+    n_diff = max(1, int(n_diff))
+    diffs = []
+    for delta in range(1, n_diff + 1):
+        padded = torch.cat([torch.zeros(delta, frames.shape[1]), frames], dim=0)
+        diff = padded[delta:] - padded[:-delta]
+        diff[:delta] = 0.0
+        diffs.append(diff.clamp_min(0.0))
+    inferred = torch.stack(diffs, dim=0).amin(dim=0)
+    max_inferred = float(inferred.max())
+    target_peak = max(0.6, float(onsets.max()))
+    if max_inferred <= 1e-8:
+        return torch.zeros_like(onsets)
+    return inferred * (target_peak / max_inferred) * max(0.0, float(scale))
+
+
 def _find_note_end(
     frame_values: torch.Tensor,
     offset_values: torch.Tensor,
@@ -160,24 +221,56 @@ def _find_note_end(
     min_frames: int,
     frame_threshold: float,
     offset_threshold: float,
-) -> int:
+) -> tuple[int, int | None]:
     low_frame_streak = 0
     for i in range(start_idx + min_frames, frame_values.numel()):
         if float(offset_values[i]) >= offset_threshold:
-            return i + 1
+            return i + 1, i
         if float(frame_values[i]) < frame_threshold:
             low_frame_streak += 1
             if low_frame_streak >= 2:
-                return max(start_idx + min_frames, i - 1)
+                return max(start_idx + min_frames, i - 1), None
         else:
             low_frame_streak = 0
-    return frame_values.numel()
+    return frame_values.numel(), None
 
 
 def _unit_to_duration(value: float, max_duration_seconds: float) -> float:
     max_duration_seconds = max(0.1, float(max_duration_seconds))
     value = max(0.0, min(1.0, float(value)))
     return math.expm1(value * math.log1p(max_duration_seconds))
+
+
+def _consume_duplicate_energy(
+    note_items: list[tuple[float, NoteEvent]],
+    neighbor_pitches: int,
+    overlap_ratio: float,
+) -> list[NoteEvent]:
+    """Keep strong notes first and suppress same/near-pitch overlapping echoes."""
+    if not note_items:
+        return []
+    neighbor_pitches = max(0, int(neighbor_pitches))
+    overlap_ratio = max(0.0, min(1.0, float(overlap_ratio)))
+    kept: list[tuple[float, NoteEvent]] = []
+    for score, note in sorted(note_items, key=lambda item: (item[0], item[1].velocity), reverse=True):
+        duplicate = False
+        for _, prev in kept:
+            if abs(note.pitch - prev.pitch) > neighbor_pitches:
+                continue
+            if _note_overlap_ratio(note, prev) >= overlap_ratio:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append((score, note))
+    return [note for _, note in kept]
+
+
+def _note_overlap_ratio(a: NoteEvent, b: NoteEvent) -> float:
+    overlap = min(a.end, b.end) - max(a.start, b.start)
+    if overlap <= 0.0:
+        return 0.0
+    shorter = max(1e-6, min(a.end - a.start, b.end - b.start))
+    return overlap / shorter
 
 
 def decode_dense_pedals(

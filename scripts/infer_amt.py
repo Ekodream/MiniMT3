@@ -27,8 +27,8 @@ def main() -> None:
     parser.add_argument("--audio", required=True)
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--out", default="outputs/amt_demo")
-    parser.add_argument("--window_seconds", type=float, default=2.0)
-    parser.add_argument("--overlap_seconds", type=float, default=0.25)
+    parser.add_argument("--window_seconds", type=float)
+    parser.add_argument("--overlap_seconds", type=float)
     parser.add_argument("--onset_threshold", type=float)
     parser.add_argument("--frame_threshold", type=float)
     parser.add_argument("--offset_threshold", type=float)
@@ -50,6 +50,14 @@ def main() -> None:
     parser.add_argument("--disable_duration_head", action="store_true")
     parser.add_argument("--max_duration_seconds", type=float)
     parser.add_argument("--duration_extension_weight", type=float)
+    parser.add_argument("--consume_note_energy", action="store_true")
+    parser.add_argument("--disable_consume_note_energy", action="store_true")
+    parser.add_argument("--energy_neighbor_pitches", type=int)
+    parser.add_argument("--energy_overlap_ratio", type=float)
+    parser.add_argument("--infer_onsets_from_frame_diff", action="store_true")
+    parser.add_argument("--disable_infer_onsets_from_frame_diff", action="store_true")
+    parser.add_argument("--frame_diff_n", type=int)
+    parser.add_argument("--frame_diff_scale", type=float)
     parser.add_argument("--pedal_threshold", type=float)
     parser.add_argument("--disable_sustain_heuristic", action="store_true")
     parser.add_argument("--performance_min_note_seconds", type=float)
@@ -77,15 +85,39 @@ def main() -> None:
     parser.add_argument("--disable_score_isolation_filter", action="store_true")
     parser.add_argument("--disable_score_fill_rests", action="store_true")
     parser.add_argument("--score_max_short_rest_beats", type=float)
+    parser.add_argument("--disable_score_start_align", action="store_true")
+    parser.add_argument("--score_leading_rest_threshold_beats", type=float)
+    parser.add_argument("--score_start_offset_beats", type=float)
+    parser.add_argument("--score_start_offset_seconds", type=float)
+    parser.add_argument("--score_chord_snap_seconds", type=float)
+    parser.add_argument("--score_chord_snap_max_spread_beats", type=float)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.ckpt, map_location=device)
     cfg = ckpt["config"]
+    target_cfg = cfg.get("targets", {})
     decode_cfg = cfg.get("decode", {})
-    onset_threshold = float(args.onset_threshold or decode_cfg.get("onset_threshold", 0.55))
-    frame_threshold = float(args.frame_threshold or decode_cfg.get("frame_threshold", 0.25))
-    offset_threshold = float(args.offset_threshold or decode_cfg.get("offset_threshold", 0.25))
+    inference_cfg = cfg.get("inference", {})
+    window_seconds = float(
+        args.window_seconds
+        if args.window_seconds is not None
+        else inference_cfg.get("window_seconds", decode_cfg.get("window_seconds", _default_window_seconds(cfg)))
+    )
+    overlap_seconds = float(
+        args.overlap_seconds
+        if args.overlap_seconds is not None
+        else inference_cfg.get("overlap_seconds", decode_cfg.get("overlap_seconds", _default_overlap_seconds(window_seconds)))
+    )
+    onset_threshold = float(
+        args.onset_threshold if args.onset_threshold is not None else _default_onset_threshold(cfg, decode_cfg)
+    )
+    frame_threshold = float(
+        args.frame_threshold if args.frame_threshold is not None else _default_frame_threshold(cfg, decode_cfg)
+    )
+    offset_threshold = float(
+        args.offset_threshold if args.offset_threshold is not None else _default_offset_threshold(cfg, decode_cfg)
+    )
     min_note_seconds = float(args.min_note_seconds or decode_cfg.get("min_note_seconds", 0.04))
     max_notes_per_second = float(args.max_notes_per_second or decode_cfg.get("max_notes_per_second", 24.0))
     max_polyphony = int(args.max_polyphony or decode_cfg.get("max_polyphony", 12))
@@ -145,6 +177,32 @@ def main() -> None:
         if args.duration_extension_weight is not None
         else decode_cfg.get("duration_extension_weight", 1.0)
     )
+    consume_note_energy = bool(
+        (args.consume_note_energy or _default_consume_note_energy(cfg, decode_cfg))
+        and not args.disable_consume_note_energy
+    )
+    energy_neighbor_pitches = int(
+        args.energy_neighbor_pitches
+        if args.energy_neighbor_pitches is not None
+        else decode_cfg.get("energy_neighbor_pitches", 1)
+    )
+    energy_overlap_ratio = float(
+        args.energy_overlap_ratio
+        if args.energy_overlap_ratio is not None
+        else decode_cfg.get("energy_overlap_ratio", 0.5)
+    )
+    infer_onsets_from_frame_diff = bool(
+        (args.infer_onsets_from_frame_diff or decode_cfg.get("infer_onsets_from_frame_diff", False))
+        and not args.disable_infer_onsets_from_frame_diff
+    )
+    frame_diff_n = int(args.frame_diff_n if args.frame_diff_n is not None else decode_cfg.get("frame_diff_n", 2))
+    frame_diff_scale = float(
+        args.frame_diff_scale if args.frame_diff_scale is not None else decode_cfg.get("frame_diff_scale", 1.0)
+    )
+    decode_center_only = bool(decode_cfg.get("decode_center_only", False))
+    reliable_margin_seconds = float(
+        decode_cfg.get("reliable_margin_seconds", target_cfg.get("supervision_margin_seconds", 0.0) or 0.0)
+    )
     pedal_threshold = float(args.pedal_threshold or decode_cfg.get("pedal_threshold", 0.50))
     performance_min_note_seconds = float(
         args.performance_min_note_seconds or decode_cfg.get("performance_min_note_seconds", 0.06)
@@ -179,6 +237,21 @@ def main() -> None:
         if args.score_max_short_rest_beats is not None
         else decode_cfg.get("score_max_short_rest_beats", 0.5)
     )
+    score_leading_rest_threshold_beats = float(
+        args.score_leading_rest_threshold_beats
+        if args.score_leading_rest_threshold_beats is not None
+        else decode_cfg.get("score_leading_rest_threshold_beats", 0.5)
+    )
+    score_chord_snap_seconds = float(
+        args.score_chord_snap_seconds
+        if args.score_chord_snap_seconds is not None
+        else decode_cfg.get("score_chord_snap_seconds", 0.075)
+    )
+    score_chord_snap_max_spread_beats = float(
+        args.score_chord_snap_max_spread_beats
+        if args.score_chord_snap_max_spread_beats is not None
+        else decode_cfg.get("score_chord_snap_max_spread_beats", 0.25)
+    )
     audio_cfg = LogMelConfig(**cfg.get("audio", {}))
     model = DenseAMT(DenseAMTConfig(**cfg.get("model", {}))).to(device)
     model.load_state_dict(ckpt["model"], strict=False)
@@ -187,7 +260,9 @@ def main() -> None:
     extractor = LogMelExtractor(audio_cfg).to(device)
     sr = audio_cfg.sample_rate
     total_seconds = waveform.shape[-1] / sr
-    step = max(0.1, args.window_seconds - args.overlap_seconds)
+    if overlap_seconds >= window_seconds:
+        overlap_seconds = max(0.0, window_seconds * 0.25)
+    step = max(0.1, window_seconds - overlap_seconds)
     starts = []
     t = 0.0
     while t < total_seconds:
@@ -200,7 +275,7 @@ def main() -> None:
     debug = []
     with torch.no_grad():
         for start in starts:
-            end = min(total_seconds, start + args.window_seconds)
+            end = min(total_seconds, start + window_seconds)
             segment = waveform[:, int(start * sr) : int(end * sr)]
             features = extractor(segment.to(device))
             out = model(features)
@@ -226,7 +301,19 @@ def main() -> None:
                 use_duration_head=not args.disable_duration_head,
                 max_duration_seconds=max_duration_seconds,
                 duration_extension_weight=duration_extension_weight,
+                time_shift_clip_frames=float(target_cfg.get("time_shift_clip_frames", 1.0)),
+                consume_note_energy=consume_note_energy,
+                energy_neighbor_pitches=energy_neighbor_pitches,
+                energy_overlap_ratio=energy_overlap_ratio,
+                infer_onsets_from_frame_diff=infer_onsets_from_frame_diff,
+                frame_diff_n=frame_diff_n,
+                frame_diff_scale=frame_diff_scale,
             )
+            before_center_notes = len(window_notes)
+            if decode_center_only and reliable_margin_seconds > 0.0 and end - start > reliable_margin_seconds * 2.0:
+                keep_lo = 0.0 if start <= 1e-6 else reliable_margin_seconds
+                keep_hi = (end - start) if end >= total_seconds - 1e-6 else (end - start - reliable_margin_seconds)
+                window_notes = [note for note in window_notes if keep_lo <= note.start < keep_hi]
             for note in window_notes:
                 note.start += start
                 note.end += start
@@ -236,7 +323,15 @@ def main() -> None:
                 pedal.start += start
                 pedal.end += start
             pedals.extend(window_pedals)
-            debug.append({"start": start, "end": end, "notes": len(window_notes), "pedals": len(window_pedals)})
+            debug.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "notes": len(window_notes),
+                    "notes_before_center_crop": before_center_notes,
+                    "pedals": len(window_pedals),
+                }
+            )
     raw_note_count = len(notes)
     notes = merge_overlapping_window_notes(notes, tolerance=merge_tolerance_seconds)
     merged_note_count = len(notes)
@@ -299,6 +394,12 @@ def main() -> None:
                 filter_isolated_notes=not args.disable_score_isolation_filter,
                 fill_short_rests=not args.disable_score_fill_rests,
                 max_short_rest_beats=score_max_short_rest_beats,
+                align_score_start=not args.disable_score_start_align,
+                leading_rest_threshold_beats=score_leading_rest_threshold_beats,
+                start_offset_beats=args.score_start_offset_beats,
+                start_offset_seconds=args.score_start_offset_seconds,
+                chord_snap_seconds=score_chord_snap_seconds,
+                chord_snap_max_spread_beats=score_chord_snap_max_spread_beats,
             ),
         )
         score_notes = polished.notes
@@ -331,6 +432,8 @@ def main() -> None:
         out_dir / f"{stem}_debug.json",
         {
             "windows": debug,
+            "window_seconds": window_seconds,
+            "overlap_seconds": overlap_seconds,
             "notes": len(performance_notes),
             "score_notes": len(score_notes),
             "raw_notes": raw_note_count,
@@ -365,6 +468,14 @@ def main() -> None:
                 "disable_duration_head": args.disable_duration_head,
                 "max_duration_seconds": max_duration_seconds,
                 "duration_extension_weight": duration_extension_weight,
+                "consume_note_energy": consume_note_energy,
+                "energy_neighbor_pitches": energy_neighbor_pitches,
+                "energy_overlap_ratio": energy_overlap_ratio,
+                "infer_onsets_from_frame_diff": infer_onsets_from_frame_diff,
+                "frame_diff_n": frame_diff_n,
+                "frame_diff_scale": frame_diff_scale,
+                "decode_center_only": decode_center_only,
+                "reliable_margin_seconds": reliable_margin_seconds,
                 "pedal_threshold": pedal_threshold,
                 "disable_sustain_heuristic": args.disable_sustain_heuristic,
                 "performance_min_note_seconds": performance_min_note_seconds,
@@ -391,6 +502,12 @@ def main() -> None:
                 "disable_score_isolation_filter": args.disable_score_isolation_filter,
                 "disable_score_fill_rests": args.disable_score_fill_rests,
                 "score_max_short_rest_beats": score_max_short_rest_beats,
+                "disable_score_start_align": args.disable_score_start_align,
+                "score_leading_rest_threshold_beats": score_leading_rest_threshold_beats,
+                "score_start_offset_beats": args.score_start_offset_beats,
+                "score_start_offset_seconds": args.score_start_offset_seconds,
+                "score_chord_snap_seconds": score_chord_snap_seconds,
+                "score_chord_snap_max_spread_beats": score_chord_snap_max_spread_beats,
             },
         },
     )
@@ -434,6 +551,52 @@ def _parse_int_tuple(value: str) -> tuple[int, ...]:
         if part:
             out.append(max(1, int(part)))
     return tuple(out or [2, 3, 4])
+
+
+def _default_window_seconds(cfg: dict) -> float:
+    manifest = str(cfg.get("train_manifest", ""))
+    target_cfg = cfg.get("targets", {})
+    if "4s" in manifest or float(target_cfg.get("max_duration_seconds", 8.0)) >= 12.0:
+        return 4.0
+    return 2.0
+
+
+def _default_onset_threshold(cfg: dict, decode_cfg: dict) -> float:
+    configured = float(decode_cfg.get("onset_threshold", 0.55))
+    manifest = str(cfg.get("train_manifest", ""))
+    output_dir = str(cfg.get("output_dir", ""))
+    if "v12_crnn_bytedance" in output_dir and "v12_2" not in output_dir:
+        return 0.42
+    if "v8_1" in output_dir or "v9" in output_dir:
+        return 0.32 if configured >= 0.40 else configured
+    if configured < 0.40 and ("v8" in manifest or "v8" in output_dir):
+        return 0.42
+    return configured
+
+
+def _default_frame_threshold(cfg: dict, decode_cfg: dict) -> float:
+    return float(decode_cfg.get("frame_threshold", 0.25))
+
+
+def _default_offset_threshold(cfg: dict, decode_cfg: dict) -> float:
+    configured = float(decode_cfg.get("offset_threshold", 0.25))
+    output_dir = str(cfg.get("output_dir", ""))
+    if "v12_crnn_bytedance" in output_dir and "v12_2" not in output_dir:
+        return 0.24
+    return configured
+
+
+def _default_consume_note_energy(cfg: dict, decode_cfg: dict) -> bool:
+    output_dir = str(cfg.get("output_dir", ""))
+    if "v12_crnn_bytedance" in output_dir and "v12_2" not in output_dir:
+        return True
+    return bool(decode_cfg.get("consume_note_energy", False))
+
+
+def _default_overlap_seconds(window_seconds: float) -> float:
+    if window_seconds >= 4.0:
+        return 0.75
+    return 0.25
 
 
 if __name__ == "__main__":

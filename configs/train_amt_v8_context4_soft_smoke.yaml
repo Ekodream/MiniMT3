@@ -29,6 +29,9 @@ log_interval: 1
 eval_interval: 2
 save_interval: 4
 debug_items: 4
+inference:
+  window_seconds: 4.0
+  overlap_seconds: 0.75
 audio:
   sample_rate: 16000
   n_mels: 128
@@ -86,7 +89,7 @@ loss:
   offset_focal_gamma_pos: 0.0
   offset_focal_gamma_neg: 0.5
 decode:
-  onset_threshold: 0.34
+  onset_threshold: 0.42
   frame_threshold: 0.12
   offset_threshold: 0.15
   min_note_seconds: 0.05
@@ -125,3 +128,6 @@ decode:
   score_merge_extension_seconds: 0.25
   score_max_overlap_beats: 0.0
   score_max_short_rest_beats: 0.5
+  score_leading_rest_threshold_beats: 0.5
+  score_chord_snap_seconds: 0.075
+  score_chord_snap_max_spread_beats: 0.25

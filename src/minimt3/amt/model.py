@@ -10,6 +10,7 @@ from minimt3.model.encoder import AudioEncoder
 
 @dataclass
 class DenseAMTConfig:
+    architecture: str = "transformer"
     n_mels: int = 128
     d_model: int = 256
     encoder_layers: int = 4
@@ -17,9 +18,11 @@ class DenseAMTConfig:
     dim_feedforward: int = 1024
     dropout: float = 0.1
     conv_channels: int = 256
+    conv_strides: tuple[int, int] | list[int] = (2, 2)
     head_hidden: int = 256
     predict_pedal: bool = False
     predict_duration: bool = False
+    predict_time_shifts: bool = False
     onset_conditioned_frame: bool = False
     position_encoding: str = "none"
     max_positions: int = 4096
@@ -28,6 +31,13 @@ class DenseAMTConfig:
     separate_head_towers: bool = False
     extra_context_layers: int = 0
     extra_context_dim_feedforward: int = 1024
+    adapter_context_layers: int = 0
+    adapter_context_dim_feedforward: int = 2048
+    acoustic_hidden: int = 768
+    acoustic_rnn_hidden: int = 256
+    acoustic_channels: tuple[int, int, int, int] | list[int] = (48, 64, 96, 128)
+    acoustic_context_layers: int = 0
+    acoustic_context_dropout: float = 0.1
 
 
 class DenseAMT(nn.Module):
@@ -36,10 +46,17 @@ class DenseAMT(nn.Module):
     def __init__(self, config: DenseAMTConfig):
         super().__init__()
         self.config = config
+        if config.architecture == "crnn_ensemble":
+            self.backend = ByteDanceStyleCRNN(config)
+            return
+        if config.architecture != "transformer":
+            raise ValueError("DenseAMTConfig.architecture must be 'transformer' or 'crnn_ensemble'")
+        self.backend = None
         self.encoder = AudioEncoder(
             n_mels=config.n_mels,
             d_model=config.d_model,
             conv_channels=config.conv_channels,
+            conv_strides=config.conv_strides,
             layers=config.encoder_layers,
             nhead=config.nhead,
             dim_feedforward=config.dim_feedforward,
@@ -80,6 +97,24 @@ class DenseAMT(nn.Module):
             self.extra_context_scale = nn.Parameter(torch.zeros(len(self.extra_context)))
         else:
             self.register_parameter("extra_context_scale", None)
+        self.adapter_context = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=config.d_model,
+                    nhead=config.nhead,
+                    dim_feedforward=config.adapter_context_dim_feedforward,
+                    dropout=config.dropout,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(config.adapter_context_layers)
+            ]
+        )
+        if self.adapter_context:
+            self.adapter_context_scale = nn.Parameter(torch.zeros(len(self.adapter_context)))
+        else:
+            self.register_parameter("adapter_context_scale", None)
         self.shared = nn.Sequential(
             nn.LayerNorm(config.d_model),
             nn.Linear(config.d_model, config.head_hidden),
@@ -116,10 +151,14 @@ class DenseAMT(nn.Module):
         self.velocity_head = nn.Linear(config.head_hidden, 88)
         self.pedal_head = nn.Linear(config.head_hidden, 1) if config.predict_pedal else None
         self.duration_head = nn.Linear(config.head_hidden, 88) if config.predict_duration else None
+        self.onset_shift_head = nn.Linear(config.head_hidden, 88) if config.predict_time_shifts else None
+        self.offset_shift_head = nn.Linear(config.head_hidden, 88) if config.predict_time_shifts else None
         if self.duration_head is not None:
             nn.init.constant_(self.duration_head.bias, -2.2)
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.backend is not None:
+            return self.backend(features)
         memory = self.encoder(features)
         if self.temporal is not None and self.temporal_proj is not None:
             temporal, _ = self.temporal(memory)
@@ -128,6 +167,10 @@ class DenseAMT(nn.Module):
             for idx, layer in enumerate(self.extra_context):
                 refined = layer(memory)
                 memory = memory + self.extra_context_scale[idx] * (refined - memory)
+        if self.adapter_context:
+            for idx, layer in enumerate(self.adapter_context):
+                refined = layer(memory)
+                memory = memory + self.adapter_context_scale[idx] * (refined - memory)
         hidden = self.shared(memory)
         onset_hidden = self.onset_tower(hidden)
         frame_hidden = self.frame_tower(hidden)
@@ -147,6 +190,9 @@ class DenseAMT(nn.Module):
             out["pedal_logits"] = self.pedal_head(hidden)
         if self.duration_head is not None:
             out["duration_logits"] = self.duration_head(hidden)
+        if self.onset_shift_head is not None and self.offset_shift_head is not None:
+            out["onset_shift_logits"] = self.onset_shift_head(onset_hidden)
+            out["offset_shift_logits"] = self.offset_shift_head(offset_hidden)
         return out
 
 
@@ -169,3 +215,225 @@ class ResidualHeadTower(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.net(x)
+
+
+class ByteDanceStyleCRNN(nn.Module):
+    """Multi-tower CRNN inspired by ByteDance high-resolution piano transcription."""
+
+    def __init__(self, config: DenseAMTConfig):
+        super().__init__()
+        self.config = config
+        channels = tuple(int(x) for x in config.acoustic_channels)
+        if len(channels) != 4:
+            raise ValueError("acoustic_channels must contain four channel sizes")
+        self.bn0 = nn.BatchNorm2d(config.n_mels, momentum=0.01)
+        tower_kwargs = {
+            "n_mels": config.n_mels,
+            "channels": channels,
+            "hidden": config.acoustic_hidden,
+            "rnn_hidden": config.acoustic_rnn_hidden,
+            "context_layers": config.acoustic_context_layers,
+            "context_dropout": config.acoustic_context_dropout,
+        }
+        self.frame_model = AcousticCRNNTower(classes=88, **tower_kwargs)
+        self.onset_model = AcousticCRNNTower(classes=88, **tower_kwargs)
+        self.offset_model = AcousticCRNNTower(classes=88, **tower_kwargs)
+        self.velocity_model = AcousticCRNNTower(classes=88, **tower_kwargs)
+        cond_hidden = int(config.acoustic_rnn_hidden)
+        self.onset_condition_gru = nn.GRU(
+            input_size=88 * 2,
+            hidden_size=cond_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.onset_condition_fc = nn.Linear(cond_hidden * 2, 88)
+        self.frame_condition_gru = nn.GRU(
+            input_size=88 * 3,
+            hidden_size=cond_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.frame_condition_fc = nn.Linear(cond_hidden * 2, 88)
+        self.pedal_model = (
+            AcousticCRNNTower(classes=1, **tower_kwargs)
+            if config.predict_pedal
+            else None
+        )
+        self.onset_shift_head = nn.Linear(cond_hidden * 2, 88) if config.predict_time_shifts else None
+        self.offset_shift_head = nn.Linear(config.acoustic_rnn_hidden * 2, 88) if config.predict_time_shifts else None
+        self.duration_head = nn.Linear(cond_hidden * 2, 88) if config.predict_duration else None
+        self._init_condition_layers()
+
+    def _init_condition_layers(self) -> None:
+        nn.init.ones_(self.bn0.weight)
+        nn.init.zeros_(self.bn0.bias)
+        for gru in (self.onset_condition_gru, self.frame_condition_gru):
+            _init_gru(gru)
+        for layer in (self.onset_condition_fc, self.frame_condition_fc, self.onset_shift_head, self.offset_shift_head, self.duration_head):
+            if layer is not None:
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+
+    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = features.transpose(1, 2).unsqueeze(1)
+        x = x.transpose(1, 3)
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        frame_base_logits, _ = self.frame_model(x)
+        onset_base_logits, _ = self.onset_model(x)
+        offset_logits, offset_hidden = self.offset_model(x)
+        velocity_logits, _ = self.velocity_model(x)
+
+        onset_base_prob = torch.sigmoid(onset_base_logits)
+        velocity_prob = torch.sigmoid(velocity_logits)
+        onset_cond = torch.cat(
+            (onset_base_prob, onset_base_prob.clamp_min(1e-6).sqrt() * velocity_prob.detach()),
+            dim=-1,
+        )
+        onset_hidden, _ = self.onset_condition_gru(onset_cond)
+        onset_logits = self.onset_condition_fc(nn.functional.dropout(onset_hidden, p=0.5, training=self.training))
+
+        frame_cond = torch.cat(
+            (
+                torch.sigmoid(frame_base_logits),
+                torch.sigmoid(onset_logits).detach(),
+                torch.sigmoid(offset_logits).detach(),
+            ),
+            dim=-1,
+        )
+        frame_hidden, _ = self.frame_condition_gru(frame_cond)
+        frame_logits = self.frame_condition_fc(nn.functional.dropout(frame_hidden, p=0.5, training=self.training))
+
+        out = {
+            "onset_logits": onset_logits,
+            "frame_logits": frame_logits,
+            "offset_logits": offset_logits,
+            "velocity_logits": velocity_logits,
+        }
+        if self.pedal_model is not None:
+            pedal_logits, _ = self.pedal_model(x)
+            out["pedal_logits"] = pedal_logits
+        if self.onset_shift_head is not None and self.offset_shift_head is not None:
+            out["onset_shift_logits"] = self.onset_shift_head(onset_hidden)
+            out["offset_shift_logits"] = self.offset_shift_head(offset_hidden)
+        if self.duration_head is not None:
+            out["duration_logits"] = self.duration_head(frame_hidden)
+        return out
+
+
+class AcousticCRNNTower(nn.Module):
+    def __init__(
+        self,
+        n_mels: int,
+        classes: int,
+        channels: tuple[int, int, int, int],
+        hidden: int,
+        rnn_hidden: int,
+        context_layers: int = 0,
+        context_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList()
+        in_channels = 1
+        for out_channels in channels:
+            self.blocks.append(ConvBlock2d(in_channels, out_channels))
+            in_channels = out_channels
+        freq_bins = max(1, int(n_mels) // (2 ** len(channels)))
+        self.fc = nn.Linear(channels[-1] * freq_bins, hidden, bias=False)
+        self.bn = nn.BatchNorm1d(hidden, momentum=0.01)
+        self.gru = nn.GRU(
+            input_size=hidden,
+            hidden_size=rnn_hidden,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.0,
+        )
+        self.context = (
+            TemporalResidualGRU(rnn_hidden * 2, rnn_hidden, context_layers, context_dropout)
+            if context_layers > 0
+            else None
+        )
+        self.out = nn.Linear(rnn_hidden * 2, classes)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.ones_(self.bn.weight)
+        nn.init.zeros_(self.bn.bias)
+        _init_gru(self.gru)
+        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        for block in self.blocks:
+            x = block(x)
+            x = nn.functional.dropout(x, p=0.2, training=self.training)
+        x = x.transpose(1, 2).flatten(2)
+        x = self.fc(x)
+        x = self.bn(x.transpose(1, 2)).transpose(1, 2)
+        x = nn.functional.relu(x)
+        x = nn.functional.dropout(x, p=0.5, training=self.training)
+        hidden, _ = self.gru(x)
+        if self.context is not None:
+            hidden = self.context(hidden)
+        hidden = nn.functional.dropout(hidden, p=0.5, training=self.training)
+        return self.out(hidden), hidden
+
+
+class TemporalResidualGRU(nn.Module):
+    """Lightweight temporal context after the acoustic tower GRU."""
+
+    def __init__(self, dim: int, hidden: int, layers: int, dropout: float):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.gru = nn.GRU(
+            input_size=dim,
+            hidden_size=hidden,
+            num_layers=int(layers),
+            batch_first=True,
+            bidirectional=True,
+            dropout=float(dropout) if int(layers) > 1 else 0.0,
+        )
+        self.dropout = nn.Dropout(float(dropout))
+        self.scale = nn.Parameter(torch.tensor(0.5))
+        _init_gru(self.gru)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        refined, _ = self.gru(self.norm(x))
+        return x + self.scale * self.dropout(refined)
+
+
+class ConvBlock2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels, momentum=0.01)
+        self.bn2 = nn.BatchNorm2d(out_channels, momentum=0.01)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.conv1.weight)
+        nn.init.xavier_uniform_(self.conv2.weight)
+        nn.init.ones_(self.bn1.weight)
+        nn.init.zeros_(self.bn1.bias)
+        nn.init.ones_(self.bn2.weight)
+        nn.init.zeros_(self.bn2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = nn.functional.relu_(self.bn1(self.conv1(x)))
+        x = nn.functional.relu_(self.bn2(self.conv2(x)))
+        return nn.functional.avg_pool2d(x, kernel_size=(1, 2))
+
+
+def _init_gru(gru: nn.GRU) -> None:
+    for name, param in gru.named_parameters():
+        if "weight_ih" in name:
+            nn.init.xavier_uniform_(param)
+        elif "weight_hh" in name:
+            nn.init.orthogonal_(param)
+        elif "bias" in name:
+            nn.init.zeros_(param)

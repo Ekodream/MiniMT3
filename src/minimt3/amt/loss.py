@@ -30,6 +30,11 @@ class DenseAMTLoss(nn.Module):
         pedal_pos_weight: float = 3.0,
         pedal_neg_weight: float = 1.0,
         duration_weight: float = 0.0,
+        onset_shift_weight: float = 0.0,
+        offset_shift_weight: float = 0.0,
+        onset_mass_weight: float = 0.0,
+        offset_mass_weight: float = 0.0,
+        frame_mass_weight: float = 0.0,
         onset_focal_gamma_pos: float = 0.0,
         onset_focal_gamma_neg: float = 0.0,
         frame_focal_gamma_pos: float = 0.0,
@@ -48,6 +53,11 @@ class DenseAMTLoss(nn.Module):
         self.pedal_weight = pedal_weight
         self.pedal_neg_weight = pedal_neg_weight
         self.duration_weight = duration_weight
+        self.onset_shift_weight = onset_shift_weight
+        self.offset_shift_weight = offset_shift_weight
+        self.onset_mass_weight = onset_mass_weight
+        self.offset_mass_weight = offset_mass_weight
+        self.frame_mass_weight = frame_mass_weight
         self.onset_focal_gamma_pos = onset_focal_gamma_pos
         self.onset_focal_gamma_neg = onset_focal_gamma_neg
         self.frame_focal_gamma_pos = frame_focal_gamma_pos
@@ -122,6 +132,18 @@ class DenseAMTLoss(nn.Module):
             "OFFSET": float(offset_loss.detach().cpu()),
             "VELOCITY": float(velocity_loss.detach().cpu()),
         }
+        if self.onset_mass_weight > 0.0:
+            onset_mass_loss = _masked_mass_loss(onset_logits, onset, valid)
+            loss = loss + self.onset_mass_weight * onset_mass_loss
+            logs["ONSET_MASS"] = float(onset_mass_loss.detach().cpu())
+        if self.offset_mass_weight > 0.0:
+            offset_mass_loss = _masked_mass_loss(offset_logits, offset, valid)
+            loss = loss + self.offset_mass_weight * offset_mass_loss
+            logs["OFFSET_MASS"] = float(offset_mass_loss.detach().cpu())
+        if self.frame_mass_weight > 0.0:
+            frame_mass_loss = _masked_mass_loss(frame_logits, frame, valid)
+            loss = loss + self.frame_mass_weight * frame_mass_loss
+            logs["FRAME_MASS"] = float(frame_mass_loss.detach().cpu())
         if self.pedal_weight > 0.0 and "pedal_logits" in model_out and "pedal" in batch:
             pedal = batch["pedal"].to(device, non_blocking=True)[:, :max_len]
             pedal_logits = model_out["pedal_logits"][:, :max_len]
@@ -144,6 +166,20 @@ class DenseAMTLoss(nn.Module):
             ).sum() / duration_denom
             loss = loss + self.duration_weight * duration_loss
             logs["DURATION"] = float(duration_loss.detach().cpu())
+        if self.onset_shift_weight > 0.0 and "onset_shift_logits" in model_out and "onset_shift" in batch:
+            onset_shift = batch["onset_shift"].to(device, non_blocking=True)[:, :max_len]
+            onset_shift_mask = batch["onset_shift_mask"].to(device, non_blocking=True)[:, :max_len]
+            onset_shift_pred = torch.tanh(model_out["onset_shift_logits"][:, :max_len])
+            onset_shift_loss = _masked_regression(onset_shift_pred, onset_shift, onset_shift_mask, valid)
+            loss = loss + self.onset_shift_weight * onset_shift_loss
+            logs["ONSET_SHIFT"] = float(onset_shift_loss.detach().cpu())
+        if self.offset_shift_weight > 0.0 and "offset_shift_logits" in model_out and "offset_shift" in batch:
+            offset_shift = batch["offset_shift"].to(device, non_blocking=True)[:, :max_len]
+            offset_shift_mask = batch["offset_shift_mask"].to(device, non_blocking=True)[:, :max_len]
+            offset_shift_pred = torch.tanh(model_out["offset_shift_logits"][:, :max_len])
+            offset_shift_loss = _masked_regression(offset_shift_pred, offset_shift, offset_shift_mask, valid)
+            loss = loss + self.offset_shift_weight * offset_shift_loss
+            logs["OFFSET_SHIFT"] = float(offset_shift_loss.detach().cpu())
         return DenseLossOutput(
             loss=loss,
             logs=logs,
@@ -177,3 +213,22 @@ def _masked_bce(
         raw = raw * weights
     denom = (valid.sum() * logits.shape[-1]).clamp_min(1.0)
     return (raw * valid).sum() / denom
+
+
+def _masked_regression(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    event_mask: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    mask = event_mask * valid
+    denom = mask.sum().clamp_min(1.0)
+    return (F.smooth_l1_loss(pred, target, reduction="none") * mask).sum() / denom
+
+
+def _masked_mass_loss(logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Penalize clip-level probability mass drift to reduce dense false positives."""
+    mask = valid.expand_as(logits)
+    pred_mass = (torch.sigmoid(logits) * mask).sum(dim=(1, 2))
+    target_mass = (target * mask).sum(dim=(1, 2))
+    return F.smooth_l1_loss(torch.log1p(pred_mass), torch.log1p(target_mass), reduction="mean")

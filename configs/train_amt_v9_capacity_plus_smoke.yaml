@@ -1,22 +1,22 @@
-seed: 137
+seed: 149
 train_manifest: data/cache/amt_train_4s_uniform192_v8.json
 val_manifest: data/cache/amt_val_4s_s8_v8.json
 train_split: train
 val_split: validation
-output_dir: outputs/ckpt_amt_v8_context4_soft_cpu_smoke
-init_from: outputs/ckpt_amt_v7_pos_towers/best.pt
-train_cache_dir: data/cache/amt_v8_cpu_smoke_train_4s_soft
-val_cache_dir: data/cache/amt_v8_cpu_smoke_val_4s_soft
-max_items: 8
-val_max_items: 4
-batch_size: 1
-eval_batch_size: 1
-num_workers: 0
-eval_workers: 0
-epochs: 1
-max_steps: 1
-lr: 0.000008
-min_lr: 0.0000025
+output_dir: outputs/ckpt_amt_v9_capacity_plus_smoke
+init_from: outputs/ckpt_amt_v8_1_precision4/best.pt
+train_cache_dir: data/cache/amt_v9_smoke_train_4s_soft1_capacity
+val_cache_dir: data/cache/amt_v9_smoke_val_4s_soft1_capacity
+max_items: 96
+val_max_items: 16
+batch_size: 6
+eval_batch_size: 6
+num_workers: 2
+eval_workers: 1
+epochs: 2
+max_steps: 4
+lr: 0.000004
+min_lr: 0.0000012
 warmup_steps: 1
 weight_decay: 0.01
 betas: [0.9, 0.98]
@@ -26,9 +26,9 @@ allow_tf32: true
 dist_timeout_minutes: 120
 prefetch_factor: 2
 log_interval: 1
-eval_interval: 1
-save_interval: 1
-debug_items: 2
+eval_interval: 2
+save_interval: 4
+debug_items: 4
 inference:
   window_seconds: 4.0
   overlap_seconds: 0.75
@@ -42,7 +42,7 @@ audio:
 targets:
   onset_width_frames: 0
   offset_width_frames: 0
-  onset_soft_radius_frames: 2
+  onset_soft_radius_frames: 1
   offset_soft_radius_frames: 1
   min_note_seconds: 0.02
   include_pedal: true
@@ -67,20 +67,22 @@ model:
   separate_head_towers: true
   extra_context_layers: 2
   extra_context_dim_feedforward: 1024
+  adapter_context_layers: 4
+  adapter_context_dim_feedforward: 2048
 loss:
-  onset_weight: 1.20
+  onset_weight: 1.18
   frame_weight: 0.58
   offset_weight: 0.95
   velocity_weight: 0.08
   pedal_weight: 0.35
-  duration_weight: 0.55
-  onset_pos_weight: 5.2
+  duration_weight: 0.52
+  onset_pos_weight: 5.0
   frame_pos_weight: 2.0
   offset_pos_weight: 6.0
   pedal_pos_weight: 3.0
-  onset_neg_weight: 1.25
+  onset_neg_weight: 1.35
   frame_neg_weight: 1.05
-  offset_neg_weight: 1.10
+  offset_neg_weight: 1.12
   pedal_neg_weight: 1.0
   onset_focal_gamma_pos: 0.0
   onset_focal_gamma_neg: 1.0
@@ -89,7 +91,7 @@ loss:
   offset_focal_gamma_pos: 0.0
   offset_focal_gamma_neg: 0.5
 decode:
-  onset_threshold: 0.42
+  onset_threshold: 0.32
   frame_threshold: 0.12
   offset_threshold: 0.15
   min_note_seconds: 0.05
@@ -99,6 +101,10 @@ decode:
   min_frame_at_onset: 0.0
   onset_frame_fusion_weight: 0.0
   disable_chord_recovery: true
+  chord_onset_threshold: 0.42
+  chord_frame_threshold: 0.20
+  chord_window_frames: 1
+  chord_score_ratio: 0.90
   onset_peak_prominence: 0.015
   max_notes_per_start_window: 10
   start_window_seconds: 0.08

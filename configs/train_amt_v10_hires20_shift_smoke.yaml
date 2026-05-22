@@ -1,23 +1,23 @@
-seed: 137
+seed: 157
 train_manifest: data/cache/amt_train_4s_uniform192_v8.json
 val_manifest: data/cache/amt_val_4s_s8_v8.json
 train_split: train
 val_split: validation
-output_dir: outputs/ckpt_amt_v8_context4_soft_cpu_smoke
-init_from: outputs/ckpt_amt_v7_pos_towers/best.pt
-train_cache_dir: data/cache/amt_v8_cpu_smoke_train_4s_soft
-val_cache_dir: data/cache/amt_v8_cpu_smoke_val_4s_soft
-max_items: 8
-val_max_items: 4
-batch_size: 1
-eval_batch_size: 1
+output_dir: outputs/ckpt_amt_v10_hires20_shift_smoke
+init_from: outputs/ckpt_amt_v9_capacity_plus/best.pt
+train_cache_dir: data/cache/amt_v10_smoke_train_4s_hires20_shift
+val_cache_dir: data/cache/amt_v10_smoke_val_4s_hires20_shift
+max_items: 32
+val_max_items: 16
+batch_size: 2
+eval_batch_size: 2
 num_workers: 0
 eval_workers: 0
-epochs: 1
-max_steps: 1
-lr: 0.000008
-min_lr: 0.0000025
-warmup_steps: 1
+epochs: 2
+max_steps: 4
+lr: 0.000006
+min_lr: 0.0000015
+warmup_steps: 2
 weight_decay: 0.01
 betas: [0.9, 0.98]
 grad_clip: 1.0
@@ -26,9 +26,9 @@ allow_tf32: true
 dist_timeout_minutes: 120
 prefetch_factor: 2
 log_interval: 1
-eval_interval: 1
-save_interval: 1
-debug_items: 2
+eval_interval: 2
+save_interval: 4
+debug_items: 4
 inference:
   window_seconds: 4.0
   overlap_seconds: 0.75
@@ -40,14 +40,17 @@ audio:
   f_min: 30.0
   f_max: 8000.0
 targets:
+  frame_strides: [2, 1]
   onset_width_frames: 0
   offset_width_frames: 0
-  onset_soft_radius_frames: 2
+  onset_soft_radius_frames: 1
   offset_soft_radius_frames: 1
   min_note_seconds: 0.02
   include_pedal: true
   include_duration: true
+  include_time_shifts: true
   max_duration_seconds: 12.0
+  time_shift_clip_frames: 1.0
 model:
   n_mels: 128
   d_model: 256
@@ -56,52 +59,62 @@ model:
   dim_feedforward: 1024
   dropout: 0.1
   conv_channels: 256
+  conv_strides: [2, 1]
   head_hidden: 256
   predict_pedal: true
   predict_duration: true
+  predict_time_shifts: true
   onset_conditioned_frame: true
   position_encoding: learned
-  max_positions: 768
+  max_positions: 1024
   recurrent_layers: 2
   recurrent_hidden: 128
   separate_head_towers: true
   extra_context_layers: 2
   extra_context_dim_feedforward: 1024
+  adapter_context_layers: 4
+  adapter_context_dim_feedforward: 2048
 loss:
-  onset_weight: 1.20
+  onset_weight: 1.28
   frame_weight: 0.58
-  offset_weight: 0.95
+  offset_weight: 1.00
   velocity_weight: 0.08
   pedal_weight: 0.35
-  duration_weight: 0.55
-  onset_pos_weight: 5.2
+  duration_weight: 0.45
+  onset_shift_weight: 0.18
+  offset_shift_weight: 0.16
+  onset_pos_weight: 7.0
   frame_pos_weight: 2.0
-  offset_pos_weight: 6.0
+  offset_pos_weight: 7.5
   pedal_pos_weight: 3.0
-  onset_neg_weight: 1.25
-  frame_neg_weight: 1.05
-  offset_neg_weight: 1.10
+  onset_neg_weight: 1.18
+  frame_neg_weight: 1.02
+  offset_neg_weight: 1.08
   pedal_neg_weight: 1.0
   onset_focal_gamma_pos: 0.0
-  onset_focal_gamma_neg: 1.0
+  onset_focal_gamma_neg: 0.8
   frame_focal_gamma_pos: 0.0
   frame_focal_gamma_neg: 0.5
   offset_focal_gamma_pos: 0.0
   offset_focal_gamma_neg: 0.5
 decode:
-  onset_threshold: 0.42
+  onset_threshold: 0.34
   frame_threshold: 0.12
   offset_threshold: 0.15
-  min_note_seconds: 0.05
-  max_notes_per_second: 36.0
+  min_note_seconds: 0.045
+  max_notes_per_second: 38.0
   max_polyphony: 12
-  min_onset_gap_seconds: 0.05
+  min_onset_gap_seconds: 0.035
   min_frame_at_onset: 0.0
   onset_frame_fusion_weight: 0.0
   disable_chord_recovery: true
-  onset_peak_prominence: 0.015
+  chord_onset_threshold: 0.42
+  chord_frame_threshold: 0.20
+  chord_window_frames: 1
+  chord_score_ratio: 0.90
+  onset_peak_prominence: 0.012
   max_notes_per_start_window: 10
-  start_window_seconds: 0.08
+  start_window_seconds: 0.07
   use_duration_head: true
   max_duration_seconds: 12.0
-  duration_extension_weight: 0.25
+  duration_extension_weight: 0.20

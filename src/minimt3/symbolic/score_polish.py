@@ -67,6 +67,12 @@ class ScorePolishConfig:
     isolation_pitch_window: int = 12
     fill_short_rests: bool = True
     max_short_rest_beats: float = 0.5
+    align_score_start: bool = True
+    leading_rest_threshold_beats: float = 0.5
+    start_offset_beats: float | None = None
+    start_offset_seconds: float | None = None
+    chord_snap_seconds: float = 0.075
+    chord_snap_max_spread_beats: float = 0.25
 
 
 @dataclass
@@ -108,12 +114,14 @@ def polish_score_notes(
     seconds_per_quarter = 60.0 / max(20.0, tempo_bpm)
     time_signature = infer_time_signature(base, tempo_bpm, cfg) if cfg.time_signature == "auto" else cfg.time_signature
     beat_divisions = _score_beat_divisions(cfg, time_signature)
+    base, start_shift = _align_score_start(base, seconds_per_quarter, cfg)
     base, key_outlier_rate = _filter_key_outliers(base, key_signature, seconds_per_quarter, cfg)
     base, isolated_rate = _filter_isolated_notes(base, seconds_per_quarter, cfg)
     pruned, long_note_rate = _prune_long_notes(base, seconds_per_quarter, cfg)
     density_limited, density_pruned_rate = _limit_note_density(pruned, seconds_per_quarter, cfg)
+    snapped, chord_snap_rate = _snap_near_chords(density_limited, seconds_per_quarter, cfg)
     quantized, quant_error, collapse_rate = _quantize_to_beat_grid(
-        density_limited,
+        snapped,
         seconds_per_quarter,
         cfg,
         beat_divisions=beat_divisions,
@@ -130,6 +138,8 @@ def polish_score_notes(
         "density_pruned_rate": density_pruned_rate,
         "key_outlier_pruned_rate": key_outlier_rate,
         "isolated_pruned_rate": isolated_rate,
+        "score_start_shift_seconds": start_shift,
+        "chord_snap_rate": chord_snap_rate,
         "short_rest_fill_rate": (right_fill_rate + left_fill_rate) / 2.0,
         "overlap_trim_rate": (right_overlap_trim_rate + left_overlap_trim_rate) / 2.0,
         "chord_collapse_rate": collapse_rate,
@@ -342,6 +352,80 @@ def _filter_isolated_notes(
             pruned += 1
     keep.sort(key=lambda n: (n.start, n.pitch, n.end))
     return keep, pruned / max(1, len(notes))
+
+
+def _align_score_start(
+    notes: list[NoteEvent],
+    seconds_per_quarter: float,
+    cfg: ScorePolishConfig,
+) -> tuple[list[NoteEvent], float]:
+    if not notes or not cfg.align_score_start:
+        return notes, 0.0
+    if cfg.start_offset_seconds is not None:
+        shift = max(0.0, float(cfg.start_offset_seconds))
+    elif cfg.start_offset_beats is not None:
+        shift = max(0.0, float(cfg.start_offset_beats) * seconds_per_quarter)
+    else:
+        first_start = min(n.start for n in notes)
+        threshold = max(0.0, cfg.leading_rest_threshold_beats) * seconds_per_quarter
+        shift = first_start if first_start >= threshold else 0.0
+    if shift <= 1e-6:
+        return notes, 0.0
+    shifted = [
+        NoteEvent(n.pitch, max(0.0, n.start - shift), max(0.0, n.end - shift), n.velocity)
+        for n in notes
+        if n.end - shift > 0.0
+    ]
+    shifted = [n for n in shifted if n.end > n.start]
+    shifted.sort(key=lambda n: (n.start, n.pitch, n.end))
+    return shifted, shift
+
+
+def _snap_near_chords(
+    notes: list[NoteEvent],
+    seconds_per_quarter: float,
+    cfg: ScorePolishConfig,
+) -> tuple[list[NoteEvent], float]:
+    if not notes or cfg.chord_snap_seconds <= 0.0:
+        return notes, 0.0
+    max_spread = min(
+        max(0.0, cfg.chord_snap_seconds),
+        max(0.0, cfg.chord_snap_max_spread_beats) * seconds_per_quarter,
+    )
+    if max_spread <= 1e-6:
+        return notes, 0.0
+    ordered = sorted(notes, key=lambda n: (n.start, n.pitch, n.end))
+    groups: list[list[NoteEvent]] = []
+    current: list[NoteEvent] = []
+    for item in ordered:
+        if current and item.start - current[0].start > max_spread:
+            groups.append(current)
+            current = []
+        current.append(item)
+    if current:
+        groups.append(current)
+
+    snapped: list[NoteEvent] = []
+    changed = 0
+    for group in groups:
+        if len(group) < 2:
+            snapped.extend(group)
+            continue
+        group = sorted(group, key=lambda n: (n.start, n.pitch, n.end))
+        span = group[-1].start - group[0].start
+        pitch_moves = [b.pitch - a.pitch for a, b in zip(group, group[1:])]
+        monotonic = all(move > 0 for move in pitch_moves) or all(move < 0 for move in pitch_moves)
+        is_arpeggio = monotonic and span >= cfg.arpeggio_min_gap_seconds
+        if is_arpeggio:
+            snapped.extend(group)
+            continue
+        anchor = min(group, key=lambda n: (n.start, -n.velocity)).start
+        for note in group:
+            if abs(note.start - anchor) > 1e-6:
+                changed += 1
+            snapped.append(NoteEvent(note.pitch, anchor, max(anchor + 0.01, note.end), note.velocity))
+    snapped.sort(key=lambda n: (n.start, n.pitch, n.end))
+    return snapped, changed / max(1, len(notes))
 
 
 def _prune_long_notes(

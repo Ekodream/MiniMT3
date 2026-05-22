@@ -12,6 +12,7 @@ class AudioEncoder(nn.Module):
         n_mels: int,
         d_model: int = 256,
         conv_channels: int = 256,
+        conv_strides: tuple[int, int] | list[int] = (2, 2),
         layers: int = 4,
         nhead: int = 8,
         dim_feedforward: int = 1024,
@@ -24,10 +25,14 @@ class AudioEncoder(nn.Module):
             raise ValueError("position_encoding must be one of: none, learned, sinusoidal")
         self.position_encoding = position_encoding
         self.max_positions = int(max_positions)
+        strides = tuple(int(s) for s in conv_strides)
+        if len(strides) != 2 or any(s < 1 for s in strides):
+            raise ValueError("conv_strides must contain two positive integers")
+        self.conv_strides = strides
         self.conv = nn.Sequential(
-            nn.Conv1d(n_mels, conv_channels, kernel_size=5, stride=2, padding=2),
+            nn.Conv1d(n_mels, conv_channels, kernel_size=5, stride=strides[0], padding=2),
             nn.GELU(),
-            nn.Conv1d(conv_channels, d_model, kernel_size=5, stride=2, padding=2),
+            nn.Conv1d(conv_channels, d_model, kernel_size=5, stride=strides[1], padding=2),
             nn.GELU(),
         )
         if position_encoding == "learned":
