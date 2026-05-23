@@ -336,6 +336,65 @@ suppresses tuplets by default, fills short notation gaps, and spells pitches acc
 For ablations, compare `--disable_score_key_filter`, `--disable_score_isolation_filter`,
 `--disable_score_fill_rests`, and `--score_allow_tuplets`.
 
+### Dense-AMT quality push: v13 large data before larger models
+
+The current dense-AMT bottleneck is no longer just parameter count. The known scale checkpoints are:
+
+```text
+v12_crnn_bytedance:      about 24.93M params, 184,704 train clips
+v13_wide:               about 64.89M params,   2,048 train clips
+v13_large_finetune:     about 64.89M params, large 8s manifest target
+v14_mid fallback:       about 47M params, large 8s manifest target
+```
+
+v13 widened the model but trained on too few 8s clips; the best debug point was around step 1200 and later checkpoints
+over-generated. The next main experiment is therefore data repair plus calibrated selection, not another blind width
+increase.
+
+Prepare the large train/calibration/score-quality manifests on the remote host:
+
+```bash
+bash scripts/remote_prepare_v13_quality.sh
+```
+
+Launch the first large-data fine-tune only after checking the remote GPUs:
+
+```bash
+LAUNCH_TRAIN=1 bash scripts/remote_prepare_v13_quality.sh
+```
+
+The first-stage config is `configs/train_amt_v13_large_finetune.yaml`. It initializes from
+`outputs/ckpt_amt_v13_wide/best.pt`, uses the large 8s manifest, adds light mass regularization, and selects checkpoints
+with a small decode-threshold sweep. If two v13 fine-tunes do not improve the calibrated validation set meaningfully,
+switch to `configs/train_amt_v14_mid.yaml` instead of continuing to lower LR indefinitely.
+
+Report model scale and manifest size:
+
+```bash
+python scripts/amt_model_report.py \
+  --config configs/train_amt_v12_crnn_bytedance.yaml \
+  --config configs/train_amt_v13_wide.yaml \
+  --config configs/train_amt_v13_large_finetune.yaml \
+  --config configs/train_amt_v14_mid.yaml
+```
+
+Run diagnostic eval with precision/recall, duration buckets, chord metrics, velocity error, score-quality metrics, and
+false-positive/false-negative examples:
+
+```bash
+python scripts/eval_amt.py \
+  --ckpt outputs/ckpt_amt_v13_wide/best.pt \
+  --manifest data/cache/amt_val_8s_s8_calib512_v13.json \
+  --items 512 \
+  --cache_dir data/cache/amt_v13_calib512_val_8s_10ms_229mel_center6 \
+  --decode_preset practice_score \
+  --score_quality_eval \
+  --analysis_json_out outputs/eval_v13_best_practice_score.json
+```
+
+For student transcription, `scripts/infer_amt.py` now defaults to `--decode_preset practice_score`, which favors clean,
+readable MusicXML. Use `--decode_preset analysis_midi` or `--decode_preset v13_recall` for higher-recall debugging.
+
 Legacy seq2seq training is still available:
 
 ```bash

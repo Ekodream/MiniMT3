@@ -3,16 +3,33 @@ from __future__ import annotations
 
 import argparse
 import math
+from typing import Any
 
 import torch
 
+from minimt3.amt.analysis import (
+    add_metric_total,
+    chord_metrics,
+    detailed_note_metrics,
+    duration_bucket_metrics,
+    error_records,
+    load_teacher_notes,
+    manifest_size,
+    model_parameter_count,
+    new_metric_total,
+    parse_duration_buckets,
+    score_quality_metrics,
+    summarize_metric_total,
+)
 from minimt3.amt.data import DenseAMTDataset
 from minimt3.amt.decode import decode_dense_notes
 from minimt3.amt.model import DenseAMT, DenseAMTConfig
+from minimt3.amt.presets import apply_decode_preset
 from minimt3.amt.targets import DenseTargetConfig
 from minimt3.audio.features import LogMelConfig
 from minimt3.symbolic.events import NoteEvent, load_midi_events
-from minimt3.utils import read_yaml, write_json
+from minimt3.symbolic.midi_io import write_midi
+from minimt3.utils import write_json
 
 
 def main() -> None:
@@ -23,9 +40,10 @@ def main() -> None:
     parser.add_argument("--items", type=int, default=16)
     parser.add_argument("--cache_dir")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--onset_thresholds", default="0.45,0.55,0.65,0.75")
-    parser.add_argument("--frame_thresholds", default="0.30,0.40,0.50")
-    parser.add_argument("--offset_thresholds", default="0.30,0.40,0.50")
+    parser.add_argument("--decode_preset")
+    parser.add_argument("--onset_thresholds")
+    parser.add_argument("--frame_thresholds")
+    parser.add_argument("--offset_thresholds")
     parser.add_argument("--max_polyphony", type=int)
     parser.add_argument("--max_notes_per_second", type=float)
     parser.add_argument("--min_onset_gap_seconds", type=float)
@@ -49,12 +67,19 @@ def main() -> None:
     parser.add_argument("--frame_diff_n", type=int)
     parser.add_argument("--frame_diff_scale", type=float)
     parser.add_argument("--eval_center_only", action="store_true")
+    parser.add_argument("--analysis_json_out")
     parser.add_argument("--json_out")
+    parser.add_argument("--error_midi_out")
+    parser.add_argument("--score_quality_eval", action="store_true")
+    parser.add_argument("--teacher_midi_dir")
+    parser.add_argument("--duration_buckets", default="0,0.125,0.5,2.0,inf")
+    parser.add_argument("--chord_tolerance_seconds", type=float, default=0.05)
     args = parser.parse_args()
 
     device = torch.device(args.device)
     ckpt = torch.load(args.ckpt, map_location=device)
     cfg = ckpt["config"]
+    decode_cfg = apply_decode_preset(cfg.get("decode", {}), args.decode_preset)
     model = DenseAMT(DenseAMTConfig(**cfg.get("model", {}))).to(device)
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
@@ -69,13 +94,14 @@ def main() -> None:
     )
     combos = [
         (onset_t, frame_t, offset_t)
-        for onset_t in _floats(args.onset_thresholds)
-        for frame_t in _floats(args.frame_thresholds)
-        for offset_t in _floats(args.offset_thresholds)
+        for onset_t in _threshold_values(args.onset_thresholds, decode_cfg, "onset_threshold", [0.45, 0.55, 0.65, 0.75])
+        for frame_t in _threshold_values(args.frame_thresholds, decode_cfg, "frame_threshold", [0.30, 0.40, 0.50])
+        for offset_t in _threshold_values(args.offset_thresholds, decode_cfg, "offset_threshold", [0.30, 0.40, 0.50])
     ]
-    decode_cfg = cfg.get("decode", {})
+    duration_buckets = parse_duration_buckets(args.duration_buckets)
     max_polyphony = int(args.max_polyphony or decode_cfg.get("max_polyphony", 12))
     max_notes_per_second = float(args.max_notes_per_second or decode_cfg.get("max_notes_per_second", 45.0))
+    min_note_seconds = float(decode_cfg.get("min_note_seconds", 0.04))
     min_onset_gap_seconds = float(
         args.min_onset_gap_seconds
         if args.min_onset_gap_seconds is not None
@@ -91,9 +117,9 @@ def main() -> None:
         if args.onset_frame_fusion_weight is not None
         else decode_cfg.get("onset_frame_fusion_weight", 0.0)
     )
-    if args.disable_chord_recovery:
-        chord_onset_threshold = None
-    else:
+    disable_chord_recovery = bool(args.disable_chord_recovery or decode_cfg.get("disable_chord_recovery", False))
+    chord_onset_threshold = None
+    if not disable_chord_recovery:
         chord_onset_threshold = (
             float(args.chord_onset_threshold)
             if args.chord_onset_threshold is not None
@@ -150,8 +176,12 @@ def main() -> None:
         args.frame_diff_scale if args.frame_diff_scale is not None else decode_cfg.get("frame_diff_scale", 1.0)
     )
     eval_center_only = bool(args.eval_center_only or decode_cfg.get("eval_center_only", False))
-    totals = {combo: {"note_f1": 0.0, "offset_f1": 0.0, "pred": 0, "ref": 0} for combo in combos}
-    item_records = []
+
+    totals = {combo: new_metric_total() for combo in combos}
+    combo_item_records: dict[tuple[float, float, float], list[dict[str, Any]]] = {combo: [] for combo in combos}
+    teacher_total = new_metric_total()
+    teacher_items = 0
+    item_best_records = []
     with torch.no_grad():
         for idx in range(len(dataset)):
             sample = dataset[idx]
@@ -159,7 +189,8 @@ def main() -> None:
             duration = float(row["end_sec"]) - float(row["start_sec"])
             out = model(sample["features"].unsqueeze(0).to(device))
             ref_notes, _ = load_midi_events(row["midi"], start=float(row["start_sec"]), end=float(row["end_sec"]))
-            best = None
+            clip_id = str(row.get("clip_id", idx))
+            best_item = None
             for combo in combos:
                 notes = decode_dense_notes(
                     out,
@@ -167,6 +198,7 @@ def main() -> None:
                     onset_threshold=combo[0],
                     frame_threshold=combo[1],
                     offset_threshold=combo[2],
+                    min_note_seconds=min_note_seconds,
                     max_notes_per_second=max_notes_per_second,
                     max_polyphony=max_polyphony,
                     min_onset_gap_seconds=min_onset_gap_seconds,
@@ -197,71 +229,162 @@ def main() -> None:
                     float(target_config.supervision_margin_seconds),
                     eval_center_only,
                 )
-                metric = note_metrics(eval_notes, eval_ref_notes)
-                totals[combo]["note_f1"] += metric["note_f1"]
-                totals[combo]["offset_f1"] += metric["offset_f1"]
-                totals[combo]["pred"] += len(eval_notes)
-                totals[combo]["ref"] += len(eval_ref_notes)
-                cand = (metric["note_f1"], metric["offset_f1"], len(eval_notes), combo)
-                if best is None or cand > best:
-                    best = cand
-            item_records.append(
-                {
+                metric = detailed_note_metrics(eval_notes, eval_ref_notes)
+                add_metric_total(totals[combo], metric)
+                fps, fns = error_records(eval_notes, eval_ref_notes, metric["matches"], clip_id)
+                record = {
                     "index": idx,
-                    "clip_id": row.get("clip_id", idx),
-                    "best_note_f1": best[0],
-                    "best_offset_f1": best[1],
-                    "pred_notes": best[2],
-                    "thresholds": best[3],
-                    "ref_notes": len(ref_notes),
+                    "clip_id": clip_id,
+                    "thresholds": combo,
                     "duration": duration,
                     "audio": row.get("audio"),
                     "midi": row.get("midi"),
+                    "metrics": _metric_without_matches(metric),
+                    "duration_buckets": duration_bucket_metrics(
+                        eval_notes,
+                        eval_ref_notes,
+                        metric["matches"],
+                        duration_buckets,
+                    ),
+                    "chord_metrics": chord_metrics(
+                        eval_notes,
+                        eval_ref_notes,
+                        metric["matches"],
+                        tolerance=float(args.chord_tolerance_seconds),
+                    ),
+                    "false_positives": fps,
+                    "false_negatives": fns,
                 }
-            )
+                if args.score_quality_eval:
+                    record["score_quality"] = score_quality_metrics(
+                        eval_notes,
+                        chord_tolerance_seconds=float(args.chord_tolerance_seconds),
+                    )
+                combo_item_records[combo].append(record)
+                cand = (metric["note_f1"], metric["offset_f1"], -metric["note_fp"], combo, record)
+                if best_item is None or cand[:4] > best_item[:4]:
+                    best_item = cand
+            assert best_item is not None
+            item_best_records.append(best_item[4])
+            teacher_notes = load_teacher_notes(args.teacher_midi_dir, row)
+            if teacher_notes is not None:
+                teacher_eval, teacher_ref = _maybe_center_crop_notes(
+                    teacher_notes,
+                    ref_notes,
+                    duration,
+                    float(target_config.supervision_margin_seconds),
+                    eval_center_only,
+                )
+                teacher_metric = detailed_note_metrics(teacher_eval, teacher_ref)
+                add_metric_total(teacher_total, teacher_metric)
+                teacher_items += 1
+            best_metric = best_item[4]["metrics"]
             print(
                 "amt_item "
-                f"index={idx} clip_id={row.get('clip_id', idx)} "
-                f"best_note_f1={best[0]:.4f} best_offset_f1={best[1]:.4f} "
-                f"pred_notes={best[2]} thresholds={best[3]} ref_notes={len(ref_notes)}",
+                f"index={idx} clip_id={clip_id} "
+                f"best_note_f1={best_metric['note_f1']:.4f} "
+                f"best_offset_f1={best_metric['offset_f1']:.4f} "
+                f"note_p={best_metric['note_precision']:.4f} note_r={best_metric['note_recall']:.4f} "
+                f"pred_notes={best_metric['pred_notes']} thresholds={best_item[3]} "
+                f"ref_notes={best_metric['ref_notes']}",
                 flush=True,
             )
-    count = max(1, len(dataset))
+
     best_combo = None
     best_score = -1e9
+    grid_summaries = []
     for combo, values in sorted(totals.items()):
-        note_f1 = values["note_f1"] / count
-        offset_f1 = values["offset_f1"] / count
-        pred_ref = values["pred"] / max(1, values["ref"])
-        score = selection_score(note_f1, offset_f1, pred_ref)
+        summary = summarize_metric_total(values)
+        score = selection_score(summary["note_f1"], summary["offset_f1"], summary["pred_ref_ratio"])
+        row = {"thresholds": combo, "score": score, **summary}
+        grid_summaries.append(row)
         print(
             "amt_summary "
             f"onset_t={combo[0]:.2f} frame_t={combo[1]:.2f} offset_t={combo[2]:.2f} "
-            f"note_f1={note_f1:.4f} offset_f1={offset_f1:.4f} "
-            f"pred_ref_ratio={pred_ref:.3f} pred_notes={values['pred']} ref_notes={values['ref']} "
+            f"note_p={summary['note_precision']:.4f} note_r={summary['note_recall']:.4f} "
+            f"note_f1={summary['note_f1']:.4f} offset_f1={summary['offset_f1']:.4f} "
+            f"pred_ref_ratio={summary['pred_ref_ratio']:.3f} "
+            f"pred_notes={summary['pred_notes']:.0f} ref_notes={summary['ref_notes']:.0f} "
             f"score={score:.4f}",
             flush=True,
         )
         if score > best_score:
             best_score = score
             best_combo = combo
+    assert best_combo is not None
     print(f"amt_best thresholds={best_combo} score={best_score:.4f}", flush=True)
+
+    best_summary = next(row for row in grid_summaries if row["thresholds"] == best_combo)
+    best_records = combo_item_records[best_combo]
+    report = {
+        "summary": {
+            "ckpt": args.ckpt,
+            "manifest": args.manifest,
+            "split": args.split,
+            "items": len(dataset),
+            "decode_preset": args.decode_preset,
+            "best_thresholds": best_combo,
+            "best_score": best_score,
+            "param_count": model_parameter_count(model),
+            "train_manifest_size": manifest_size(cfg.get("train_manifest")),
+            "eval_manifest_size": manifest_size(args.manifest),
+            **best_summary,
+        },
+        "param_count": model_parameter_count(model),
+        "train_manifest_size": manifest_size(cfg.get("train_manifest")),
+        "threshold_grid": grid_summaries,
+        "precision_recall": {
+            key: best_summary[key]
+            for key in ("note_precision", "note_recall", "note_f1", "offset_precision", "offset_recall", "offset_f1")
+        },
+        "duration_buckets": _average_nested(best_records, "duration_buckets"),
+        "long_note_metrics": _average_nested(best_records, "duration_buckets").get(">2s", {}),
+        "chord_metrics": _average_nested(best_records, "chord_metrics"),
+        "velocity_metrics": {
+            "velocity_mae": best_summary["velocity_mae"],
+            "velocity_bias": best_summary["velocity_bias"],
+        },
+        "score_quality": _average_nested(best_records, "score_quality") if args.score_quality_eval else {},
+        "teacher_baseline": summarize_metric_total(teacher_total) if teacher_items else {},
+        "worst_items": sorted(best_records, key=lambda item: item["metrics"]["note_f1"])[:20],
+        "false_positives": _flatten_limited(best_records, "false_positives", 200),
+        "false_negatives": _flatten_limited(best_records, "false_negatives", 200),
+        "items": best_records,
+        "item_best_records": item_best_records,
+        "decode": {
+            "consume_note_energy": consume_note_energy,
+            "infer_onsets_from_frame_diff": infer_onsets_from_frame_diff,
+            "eval_center_only": eval_center_only,
+            "disable_chord_recovery": disable_chord_recovery,
+            "chord_tolerance_seconds": args.chord_tolerance_seconds,
+            "duration_buckets": [label for label, _, _ in duration_buckets],
+        },
+    }
+    if args.analysis_json_out:
+        write_json(args.analysis_json_out, report)
     if args.json_out:
-        write_json(
-            args.json_out,
-            {
-                "best_thresholds": best_combo,
-                "best_score": best_score,
-                "items": item_records,
-                "consume_note_energy": consume_note_energy,
-                "infer_onsets_from_frame_diff": infer_onsets_from_frame_diff,
-                "eval_center_only": eval_center_only,
-            },
-        )
+        write_json(args.json_out, report)
+    if args.error_midi_out:
+        write_midi(args.error_midi_out, _error_notes_for_midi(best_records), [])
 
 
-def _floats(value: str) -> list[float]:
-    return [float(x.strip()) for x in value.split(",") if x.strip()]
+def _threshold_values(arg_value: str | None, decode_cfg: dict[str, Any], key: str, defaults: list[float]) -> list[float]:
+    if arg_value:
+        return _floats(arg_value)
+    grid_key = f"{key}s"
+    if grid_key in decode_cfg:
+        return _floats(decode_cfg[grid_key])
+    if key in decode_cfg:
+        return [float(decode_cfg[key])]
+    return defaults
+
+
+def _floats(value: str | float | int | list[float] | tuple[float, ...]) -> list[float]:
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, (list, tuple)):
+        return [float(x) for x in value]
+    return [float(x.strip()) for x in str(value).split(",") if x.strip()]
 
 
 def selection_score(note_f1: float, offset_f1: float, pred_ref_ratio: float) -> float:
@@ -290,38 +413,77 @@ def _maybe_center_crop_notes(
     )
 
 
-def note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dict[str, float]:
-    try:
-        import mir_eval.transcription
-        import numpy as np
-    except ImportError:
-        return {"note_f1": 0.0, "offset_f1": 0.0}
-    ref_intervals, ref_pitches = note_arrays(ref_notes, np)
-    pred_intervals, pred_pitches = note_arrays(pred_notes, np)
-    onset = mir_eval.transcription.precision_recall_f1_overlap(
-        ref_intervals,
-        ref_pitches,
-        pred_intervals,
-        pred_pitches,
-        offset_ratio=None,
-    )
-    offset = mir_eval.transcription.precision_recall_f1_overlap(
-        ref_intervals,
-        ref_pitches,
-        pred_intervals,
-        pred_pitches,
-        offset_ratio=0.2,
-    )
-    return {"note_f1": float(onset[2]), "offset_f1": float(offset[2])}
+def _metric_without_matches(metric: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in metric.items() if key != "matches"}
 
 
-def note_arrays(notes: list[NoteEvent], np_module):
-    if not notes:
-        return np_module.zeros((0, 2)), np_module.zeros((0,), dtype=int)
-    return (
-        np_module.array([[n.start, n.end] for n in notes], dtype=float),
-        np_module.array([n.pitch for n in notes], dtype=int),
-    )
+def _average_nested(records: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    sums: dict[str, Any] = {}
+    counts: dict[str, Any] = {}
+    for record in records:
+        value = record.get(key)
+        if not isinstance(value, dict):
+            continue
+        _add_nested(sums, counts, value)
+    return _divide_nested(sums, counts)
+
+
+def _add_nested(sums: dict[str, Any], counts: dict[str, Any], value: dict[str, Any]) -> None:
+    for key, item in value.items():
+        if isinstance(item, dict):
+            sums.setdefault(key, {})
+            counts.setdefault(key, {})
+            _add_nested(sums[key], counts[key], item)
+        elif isinstance(item, (int, float)):
+            sums[key] = sums.get(key, 0.0) + float(item)
+            counts[key] = counts.get(key, 0) + 1
+
+
+def _divide_nested(sums: dict[str, Any], counts: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, item in sums.items():
+        if isinstance(item, dict):
+            out[key] = _divide_nested(item, counts.get(key, {}))
+        else:
+            out[key] = item / max(1, counts.get(key, 0))
+    return out
+
+
+def _flatten_limited(records: list[dict[str, Any]], key: str, limit: int) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for record in records:
+        out.extend(record.get(key, []))
+        if len(out) >= limit:
+            return out[:limit]
+    return out
+
+
+def _error_notes_for_midi(records: list[dict[str, Any]]) -> list[NoteEvent]:
+    notes: list[NoteEvent] = []
+    cursor = 0.0
+    for record in records:
+        duration = float(record.get("duration", 0.0))
+        for item in record.get("false_positives", []):
+            notes.append(
+                NoteEvent(
+                    int(item["pitch"]),
+                    cursor + float(item["start"]),
+                    cursor + float(item["end"]),
+                    38,
+                )
+            )
+        for item in record.get("false_negatives", []):
+            notes.append(
+                NoteEvent(
+                    int(item["pitch"]),
+                    cursor + float(item["start"]),
+                    cursor + float(item["end"]),
+                    112,
+                )
+            )
+        cursor += max(2.0, duration) + 1.0
+    notes.sort(key=lambda note: (note.start, note.pitch, note.end))
+    return notes
 
 
 if __name__ == "__main__":

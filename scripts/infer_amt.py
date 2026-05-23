@@ -8,6 +8,7 @@ import torch
 
 from minimt3.amt.decode import decode_dense_notes, decode_dense_pedals
 from minimt3.amt.model import DenseAMT, DenseAMTConfig
+from minimt3.amt.presets import apply_decode_preset
 from minimt3.audio.features import LogMelConfig, LogMelExtractor
 from minimt3.audio.preprocess import load_audio
 from minimt3.symbolic.cleanup import (
@@ -27,6 +28,7 @@ def main() -> None:
     parser.add_argument("--audio", required=True)
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--out", default="outputs/amt_demo")
+    parser.add_argument("--decode_preset", default="practice_score")
     parser.add_argument("--window_seconds", type=float)
     parser.add_argument("--overlap_seconds", type=float)
     parser.add_argument("--onset_threshold", type=float)
@@ -97,7 +99,7 @@ def main() -> None:
     ckpt = torch.load(args.ckpt, map_location=device)
     cfg = ckpt["config"]
     target_cfg = cfg.get("targets", {})
-    decode_cfg = cfg.get("decode", {})
+    decode_cfg = apply_decode_preset(cfg.get("decode", {}), args.decode_preset)
     inference_cfg = cfg.get("inference", {})
     window_seconds = float(
         args.window_seconds
@@ -137,7 +139,8 @@ def main() -> None:
         if args.onset_frame_fusion_weight is not None
         else decode_cfg.get("onset_frame_fusion_weight", 0.0)
     )
-    if args.disable_chord_recovery:
+    disable_chord_recovery = bool(args.disable_chord_recovery or decode_cfg.get("disable_chord_recovery", False))
+    if disable_chord_recovery:
         chord_onset_threshold = None
     else:
         chord_onset_threshold = (
@@ -460,7 +463,9 @@ def main() -> None:
                 "chord_onset_threshold": chord_onset_threshold,
                 "chord_frame_threshold": chord_frame_threshold,
                 "chord_window_frames": chord_window_frames,
-                "disable_chord_recovery": args.disable_chord_recovery,
+                "disable_chord_recovery": disable_chord_recovery,
+                "decode_preset": args.decode_preset,
+                "score_profile": decode_cfg.get("score_profile"),
                 "chord_score_ratio": chord_score_ratio,
                 "onset_peak_prominence": onset_peak_prominence,
                 "max_notes_per_start_window": max_notes_per_start_window,

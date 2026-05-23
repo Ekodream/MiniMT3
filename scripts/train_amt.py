@@ -18,6 +18,7 @@ from minimt3.amt.data import DenseAMTCollator, DenseAMTDataset
 from minimt3.amt.decode import decode_dense_notes
 from minimt3.amt.loss import DenseAMTLoss
 from minimt3.amt.model import DenseAMT, DenseAMTConfig
+from minimt3.amt.presets import apply_decode_preset
 from minimt3.amt.targets import DenseTargetConfig
 from minimt3.audio.features import LogMelConfig
 from minimt3.symbolic.events import NoteEvent, load_midi_events
@@ -232,9 +233,13 @@ def evaluate(model, loader, criterion, device, use_amp: bool, amp_dtype: torch.d
 def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], step: int) -> dict[str, float]:
     was_training = model.training
     model.eval()
-    decode_cfg = cfg.get("decode", {})
+    decode_cfg = apply_decode_preset(cfg.get("decode", {}), cfg.get("decode_preset"))
+    combos = _debug_decode_combos(cfg, decode_cfg)
     max_items = min(int(cfg.get("debug_items", 8)), len(dataset))
-    totals = {"note_f1": 0.0, "offset_f1": 0.0, "pred": 0, "ref": 0}
+    totals = {
+        combo: {"note_f1": 0.0, "offset_f1": 0.0, "pred": 0, "ref": 0, "bad_clips": 0}
+        for combo in combos
+    }
     for idx in range(max_items):
         sample = dataset[idx]
         features = sample["features"].unsqueeze(0).to(device)
@@ -244,71 +249,120 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
         chord_onset_threshold = decode_cfg.get("chord_onset_threshold")
         if bool(decode_cfg.get("disable_chord_recovery", False)):
             chord_onset_threshold = None
-        notes = decode_dense_notes(
-            out,
-            duration=duration,
-            onset_threshold=float(decode_cfg.get("onset_threshold", 0.45)),
-            frame_threshold=float(decode_cfg.get("frame_threshold", 0.35)),
-            offset_threshold=float(decode_cfg.get("offset_threshold", 0.35)),
-            min_note_seconds=float(decode_cfg.get("min_note_seconds", 0.04)),
-            max_notes_per_second=float(decode_cfg.get("max_notes_per_second", 45.0)),
-            max_polyphony=int(decode_cfg.get("max_polyphony", 12)),
-            min_onset_gap_seconds=float(decode_cfg.get("min_onset_gap_seconds", 0.06)),
-            min_frame_at_onset=float(decode_cfg.get("min_frame_at_onset", 0.0)),
-            onset_frame_fusion_weight=float(decode_cfg.get("onset_frame_fusion_weight", 0.0)),
-            chord_onset_threshold=chord_onset_threshold,
-            chord_frame_threshold=float(decode_cfg.get("chord_frame_threshold", 0.35)),
-            chord_window_frames=int(decode_cfg.get("chord_window_frames", 1)),
-            chord_score_ratio=float(decode_cfg.get("chord_score_ratio", 0.75)),
-            onset_peak_prominence=float(decode_cfg.get("onset_peak_prominence", 0.0)),
-            max_notes_per_start_window=decode_cfg.get("max_notes_per_start_window"),
-            start_window_seconds=float(decode_cfg.get("start_window_seconds", 0.08)),
-            use_duration_head=bool(decode_cfg.get("use_duration_head", True)),
-            max_duration_seconds=float(decode_cfg.get("max_duration_seconds", 8.0)),
-            duration_extension_weight=float(decode_cfg.get("duration_extension_weight", 1.0)),
-            time_shift_clip_frames=float(cfg.get("targets", {}).get("time_shift_clip_frames", 1.0)),
-            consume_note_energy=bool(decode_cfg.get("consume_note_energy", False)),
-            energy_neighbor_pitches=int(decode_cfg.get("energy_neighbor_pitches", 1)),
-            energy_overlap_ratio=float(decode_cfg.get("energy_overlap_ratio", 0.5)),
-            infer_onsets_from_frame_diff=bool(decode_cfg.get("infer_onsets_from_frame_diff", False)),
-            frame_diff_n=int(decode_cfg.get("frame_diff_n", 2)),
-            frame_diff_scale=float(decode_cfg.get("frame_diff_scale", 1.0)),
-        )
         ref_notes, _ = load_midi_events(row["midi"], start=float(row["start_sec"]), end=float(row["end_sec"]))
-        notes, ref_notes = _maybe_center_crop_notes(notes, ref_notes, row, cfg)
-        metric = note_metrics(notes, ref_notes)
-        totals["note_f1"] += metric["note_f1"]
-        totals["offset_f1"] += metric["offset_f1"]
-        totals["pred"] += len(notes)
-        totals["ref"] += len(ref_notes)
-        totals.setdefault("bad_clips", 0)
-        if metric["note_f1"] < float(cfg.get("bad_clip_f1_threshold", 0.05)):
-            totals["bad_clips"] += 1
+        best_item = None
+        for combo in combos:
+            notes = decode_dense_notes(
+                out,
+                duration=duration,
+                onset_threshold=combo[0],
+                frame_threshold=combo[1],
+                offset_threshold=combo[2],
+                min_note_seconds=float(decode_cfg.get("min_note_seconds", 0.04)),
+                max_notes_per_second=float(decode_cfg.get("max_notes_per_second", 45.0)),
+                max_polyphony=int(decode_cfg.get("max_polyphony", 12)),
+                min_onset_gap_seconds=float(decode_cfg.get("min_onset_gap_seconds", 0.06)),
+                min_frame_at_onset=float(decode_cfg.get("min_frame_at_onset", 0.0)),
+                onset_frame_fusion_weight=float(decode_cfg.get("onset_frame_fusion_weight", 0.0)),
+                chord_onset_threshold=chord_onset_threshold,
+                chord_frame_threshold=float(decode_cfg.get("chord_frame_threshold", 0.35)),
+                chord_window_frames=int(decode_cfg.get("chord_window_frames", 1)),
+                chord_score_ratio=float(decode_cfg.get("chord_score_ratio", 0.75)),
+                onset_peak_prominence=float(decode_cfg.get("onset_peak_prominence", 0.0)),
+                max_notes_per_start_window=decode_cfg.get("max_notes_per_start_window"),
+                start_window_seconds=float(decode_cfg.get("start_window_seconds", 0.08)),
+                use_duration_head=bool(decode_cfg.get("use_duration_head", True)),
+                max_duration_seconds=float(decode_cfg.get("max_duration_seconds", 8.0)),
+                duration_extension_weight=float(decode_cfg.get("duration_extension_weight", 1.0)),
+                time_shift_clip_frames=float(cfg.get("targets", {}).get("time_shift_clip_frames", 1.0)),
+                consume_note_energy=bool(decode_cfg.get("consume_note_energy", False)),
+                energy_neighbor_pitches=int(decode_cfg.get("energy_neighbor_pitches", 1)),
+                energy_overlap_ratio=float(decode_cfg.get("energy_overlap_ratio", 0.5)),
+                infer_onsets_from_frame_diff=bool(decode_cfg.get("infer_onsets_from_frame_diff", False)),
+                frame_diff_n=int(decode_cfg.get("frame_diff_n", 2)),
+                frame_diff_scale=float(decode_cfg.get("frame_diff_scale", 1.0)),
+            )
+            eval_notes, eval_ref_notes = _maybe_center_crop_notes(notes, ref_notes, row, cfg)
+            metric = note_metrics(eval_notes, eval_ref_notes)
+            totals[combo]["note_f1"] += metric["note_f1"]
+            totals[combo]["offset_f1"] += metric["offset_f1"]
+            totals[combo]["pred"] += len(eval_notes)
+            totals[combo]["ref"] += len(eval_ref_notes)
+            if metric["note_f1"] < float(cfg.get("bad_clip_f1_threshold", 0.05)):
+                totals[combo]["bad_clips"] += 1
+            candidate = (metric["note_f1"], metric["offset_f1"], -len(eval_notes), combo, len(eval_notes), len(eval_ref_notes))
+            if best_item is None or candidate[:4] > best_item[:4]:
+                best_item = candidate
+        assert best_item is not None
         print(
             "debug_amt "
             f"step={step} item={idx} clip_id={row.get('clip_id', idx)} "
-            f"pred_notes={len(notes)} ref_notes={len(ref_notes)} "
-            f"note_f1={metric['note_f1']:.4f} offset_f1={metric['offset_f1']:.4f}",
+            f"pred_notes={best_item[4]} ref_notes={best_item[5]} "
+            f"note_f1={best_item[0]:.4f} offset_f1={best_item[1]:.4f} thresholds={best_item[3]}",
             flush=True,
         )
     count = max(1, max_items)
-    pred_ref = totals["pred"] / max(1, totals["ref"])
-    summary = {
-        "note_f1": totals["note_f1"] / count,
-        "offset_f1": totals["offset_f1"] / count,
-        "pred_ref_ratio": pred_ref,
-        "bad_clip_rate": totals.get("bad_clips", 0) / count,
-    }
+    best_summary = None
+    best_score = -math.inf
+    for combo, values in sorted(totals.items()):
+        pred_ref = values["pred"] / max(1, values["ref"])
+        summary = {
+            "note_f1": values["note_f1"] / count,
+            "offset_f1": values["offset_f1"] / count,
+            "pred_ref_ratio": pred_ref,
+            "bad_clip_rate": values["bad_clips"] / count,
+            "pred_notes": values["pred"],
+            "ref_notes": values["ref"],
+            "thresholds": combo,
+        }
+        score = selection_score(summary)
+        if len(combos) > 1:
+            print(
+                "debug_amt_sweep "
+                f"step={step} thresholds={combo} note_f1={summary['note_f1']:.4f} "
+                f"offset_f1={summary['offset_f1']:.4f} pred_ref_ratio={pred_ref:.3f} "
+                f"score={score:.5f}",
+                flush=True,
+            )
+        if score > best_score:
+            best_score = score
+            best_summary = summary
+    assert best_summary is not None
     print(
         "debug_amt_summary "
-        f"step={step} note_f1={summary['note_f1']:.4f} offset_f1={summary['offset_f1']:.4f} "
-        f"pred_ref_ratio={pred_ref:.3f} bad_clip_rate={summary['bad_clip_rate']:.3f} "
-        f"pred_notes={totals['pred']} ref_notes={totals['ref']}",
+        f"step={step} thresholds={best_summary['thresholds']} "
+        f"note_f1={best_summary['note_f1']:.4f} offset_f1={best_summary['offset_f1']:.4f} "
+        f"pred_ref_ratio={best_summary['pred_ref_ratio']:.3f} bad_clip_rate={best_summary['bad_clip_rate']:.3f} "
+        f"pred_notes={best_summary['pred_notes']} ref_notes={best_summary['ref_notes']}",
         flush=True,
     )
     if was_training:
         model.train()
-    return summary
+    return best_summary
+
+
+def _debug_decode_combos(cfg: dict[str, Any], decode_cfg: dict[str, Any]) -> list[tuple[float, float, float]]:
+    sweep = cfg.get("selection_sweep") or cfg.get("eval", {}).get("selection_sweep")
+    if not sweep or not bool(sweep.get("enabled", False)):
+        return [
+            (
+                float(decode_cfg.get("onset_threshold", 0.45)),
+                float(decode_cfg.get("frame_threshold", 0.35)),
+                float(decode_cfg.get("offset_threshold", 0.35)),
+            )
+        ]
+    onset_values = _float_values(sweep.get("onset_thresholds", decode_cfg.get("onset_threshold", 0.45)))
+    frame_values = _float_values(sweep.get("frame_thresholds", decode_cfg.get("frame_threshold", 0.35)))
+    offset_values = _float_values(sweep.get("offset_thresholds", decode_cfg.get("offset_threshold", 0.35)))
+    return [(o, f, off) for o in onset_values for f in frame_values for off in offset_values]
+
+
+def _float_values(value: Any) -> list[float]:
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, (list, tuple)):
+        return [float(x) for x in value]
+    return [float(part.strip()) for part in str(value).split(",") if part.strip()]
 
 
 def selection_score(debug: dict[str, float]) -> float:

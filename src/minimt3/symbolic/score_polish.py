@@ -50,6 +50,10 @@ class ScorePolishConfig:
     arpeggio_max_gap_seconds: float = 0.25
     min_note_beats: float = 0.25
     max_note_beats: float = 4.0
+    bass_max_note_beats: float = 8.0
+    bass_protect_pitch: int = 48
+    protect_bass_long_notes: bool = True
+    protect_chord_tone_durations: bool = True
     same_pitch_margin_seconds: float = 0.02
     min_velocity: int = 6
     max_chord_notes: int = 10
@@ -436,6 +440,9 @@ def _prune_long_notes(
     if not notes:
         return [], 0.0
     max_duration = max(cfg.min_note_beats * seconds_per_quarter, cfg.max_note_beats * seconds_per_quarter)
+    bass_max_duration = max(max_duration, cfg.bass_max_note_beats * seconds_per_quarter)
+    chord_groups = _group_by_start(notes, tolerance=cfg.chord_tolerance_seconds)
+    chord_size = {id(note): len(group) for group in chord_groups for note in group}
     by_pitch: dict[int, list[NoteEvent]] = {}
     for note in notes:
         by_pitch.setdefault(note.pitch, []).append(note)
@@ -452,9 +459,14 @@ def _prune_long_notes(
         next_pitch_start = next_start.get(id(note))
         if next_pitch_start is not None:
             end = min(end, max(note.start + 0.01, next_pitch_start - cfg.same_pitch_margin_seconds))
-        if cfg.prune_pedal_resonance and end - note.start > max_duration:
+        note_max_duration = max_duration
+        if cfg.protect_bass_long_notes and int(note.pitch) <= int(cfg.bass_protect_pitch):
+            note_max_duration = bass_max_duration
+        if cfg.protect_chord_tone_durations and chord_size.get(id(note), 1) >= 2:
+            note_max_duration = max(note_max_duration, max_duration * 1.5)
+        if cfg.prune_pedal_resonance and end - note.start > note_max_duration:
             long_count += 1
-            end = note.start + max_duration
+            end = note.start + note_max_duration
         if end > note.start:
             pruned.append(NoteEvent(note.pitch, note.start, end, note.velocity))
     pruned.sort(key=lambda n: (n.start, n.pitch, n.end))
