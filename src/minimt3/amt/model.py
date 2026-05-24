@@ -38,6 +38,9 @@ class DenseAMTConfig:
     acoustic_channels: tuple[int, int, int, int] | list[int] = (48, 64, 96, 128)
     acoustic_context_layers: int = 0
     acoustic_context_dropout: float = 0.1
+    acoustic_attention_layers: int = 0
+    acoustic_attention_heads: int = 8
+    acoustic_attention_dim_feedforward: int = 2048
 
 
 class DenseAMT(nn.Module):
@@ -234,6 +237,9 @@ class ByteDanceStyleCRNN(nn.Module):
             "rnn_hidden": config.acoustic_rnn_hidden,
             "context_layers": config.acoustic_context_layers,
             "context_dropout": config.acoustic_context_dropout,
+            "attention_layers": config.acoustic_attention_layers,
+            "attention_heads": config.acoustic_attention_heads,
+            "attention_dim_feedforward": config.acoustic_attention_dim_feedforward,
         }
         self.frame_model = AcousticCRNNTower(classes=88, **tower_kwargs)
         self.onset_model = AcousticCRNNTower(classes=88, **tower_kwargs)
@@ -333,6 +339,9 @@ class AcousticCRNNTower(nn.Module):
         rnn_hidden: int,
         context_layers: int = 0,
         context_dropout: float = 0.1,
+        attention_layers: int = 0,
+        attention_heads: int = 8,
+        attention_dim_feedforward: int = 2048,
     ):
         super().__init__()
         self.blocks = nn.ModuleList()
@@ -354,6 +363,17 @@ class AcousticCRNNTower(nn.Module):
         self.context = (
             TemporalResidualGRU(rnn_hidden * 2, rnn_hidden, context_layers, context_dropout)
             if context_layers > 0
+            else None
+        )
+        self.attention_context = (
+            TemporalResidualAttention(
+                dim=rnn_hidden * 2,
+                layers=attention_layers,
+                heads=attention_heads,
+                dim_feedforward=attention_dim_feedforward,
+                dropout=context_dropout,
+            )
+            if attention_layers > 0
             else None
         )
         self.out = nn.Linear(rnn_hidden * 2, classes)
@@ -379,6 +399,8 @@ class AcousticCRNNTower(nn.Module):
         hidden, _ = self.gru(x)
         if self.context is not None:
             hidden = self.context(hidden)
+        if self.attention_context is not None:
+            hidden = self.attention_context(hidden)
         hidden = nn.functional.dropout(hidden, p=0.5, training=self.training)
         return self.out(hidden), hidden
 
@@ -404,6 +426,45 @@ class TemporalResidualGRU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         refined, _ = self.gru(self.norm(x))
         return x + self.scale * self.dropout(refined)
+
+
+class TemporalResidualAttention(nn.Module):
+    """Residual self-attention context on top of the CRNN tower hidden states."""
+
+    def __init__(self, dim: int, layers: int, heads: int, dim_feedforward: int, dropout: float):
+        super().__init__()
+        layers = int(layers)
+        heads = max(1, int(heads))
+        if dim % heads != 0:
+            heads = max(1, _largest_divisor_at_most(dim, heads))
+        self.layers = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=dim,
+                    nhead=heads,
+                    dim_feedforward=int(dim_feedforward),
+                    dropout=float(dropout),
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(layers)
+            ]
+        )
+        self.scale = nn.Parameter(torch.zeros(layers))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for idx, layer in enumerate(self.layers):
+            refined = layer(x)
+            x = x + self.scale[idx] * (refined - x)
+        return x
+
+
+def _largest_divisor_at_most(value: int, limit: int) -> int:
+    for candidate in range(max(1, limit), 0, -1):
+        if value % candidate == 0:
+            return candidate
+    return 1
 
 
 class ConvBlock2d(nn.Module):

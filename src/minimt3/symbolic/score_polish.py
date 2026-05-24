@@ -121,6 +121,7 @@ def polish_score_notes(
     base, start_shift = _align_score_start(base, seconds_per_quarter, cfg)
     base, key_outlier_rate = _filter_key_outliers(base, key_signature, seconds_per_quarter, cfg)
     base, isolated_rate = _filter_isolated_notes(base, seconds_per_quarter, cfg)
+    base, tiny_pruned_rate = _filter_tiny_score_notes(base, seconds_per_quarter, cfg)
     pruned, long_note_rate = _prune_long_notes(base, seconds_per_quarter, cfg)
     density_limited, density_pruned_rate = _limit_note_density(pruned, seconds_per_quarter, cfg)
     snapped, chord_snap_rate = _snap_near_chords(density_limited, seconds_per_quarter, cfg)
@@ -142,6 +143,7 @@ def polish_score_notes(
         "density_pruned_rate": density_pruned_rate,
         "key_outlier_pruned_rate": key_outlier_rate,
         "isolated_pruned_rate": isolated_rate,
+        "tiny_pruned_rate": tiny_pruned_rate,
         "score_start_shift_seconds": start_shift,
         "chord_snap_rate": chord_snap_rate,
         "short_rest_fill_rate": (right_fill_rate + left_fill_rate) / 2.0,
@@ -209,6 +211,8 @@ def estimate_tempo_bpm(notes: list[NoteEvent], min_bpm: int = 50, max_bpm: int =
 def infer_time_signature(notes: list[NoteEvent], tempo_bpm: float, cfg: ScorePolishConfig | None = None) -> str:
     cfg = cfg or ScorePolishConfig()
     if not notes:
+        return "4/4"
+    if not cfg.allow_tuplets:
         return "4/4"
     spq = 60.0 / max(20.0, tempo_bpm)
     onsets = sorted({round(n.start, 4) for n in notes})
@@ -354,6 +358,33 @@ def _filter_isolated_notes(
             keep.append(note)
         else:
             pruned += 1
+    keep.sort(key=lambda n: (n.start, n.pitch, n.end))
+    return keep, pruned / max(1, len(notes))
+
+
+def _filter_tiny_score_notes(
+    notes: list[NoteEvent],
+    seconds_per_quarter: float,
+    cfg: ScorePolishConfig,
+) -> tuple[list[NoteEvent], float]:
+    if not notes:
+        return [], 0.0
+    min_duration = max(0.03, cfg.min_note_beats * seconds_per_quarter * 0.65)
+    groups = _group_by_start(notes, tolerance=cfg.chord_tolerance_seconds)
+    group_size = {id(note): len(group) for group in groups for note in group}
+    keep: list[NoteEvent] = []
+    pruned = 0
+    for note in notes:
+        duration = note.end - note.start
+        protected = (
+            group_size.get(id(note), 1) >= 2
+            or int(note.pitch) <= int(cfg.bass_protect_pitch)
+            or int(note.velocity) >= max(cfg.isolated_max_velocity, cfg.non_key_max_velocity)
+        )
+        if duration < min_duration and not protected:
+            pruned += 1
+            continue
+        keep.append(note)
     keep.sort(key=lambda n: (n.start, n.pitch, n.end))
     return keep, pruned / max(1, len(notes))
 
@@ -535,8 +566,26 @@ def _limit_note_density(
         if len(beat_notes) <= cfg.max_notes_per_beat:
             kept.extend(beat_notes)
             continue
-        ranked = sorted(beat_notes, key=lambda n: (n.velocity, n.end - n.start), reverse=True)
-        keep = ranked[: cfg.max_notes_per_beat]
+        groups = _group_by_start(beat_notes, tolerance=cfg.chord_tolerance_seconds)
+        groups.sort(
+            key=lambda group: (
+                len(group) >= 2,
+                max(n.velocity for n in group),
+                max(n.end - n.start for n in group),
+                -group[0].start,
+            ),
+            reverse=True,
+        )
+        keep: list[NoteEvent] = []
+        soft_limit = max(cfg.max_notes_per_beat, min(cfg.max_chord_notes, cfg.max_notes_per_beat + 2))
+        for group in groups:
+            next_count = len(keep) + len(group)
+            if next_count <= cfg.max_notes_per_beat:
+                keep.extend(group)
+            elif len(group) >= 2 and len(keep) < cfg.max_notes_per_beat and next_count <= soft_limit:
+                keep.extend(group)
+        if not keep:
+            keep = sorted(beat_notes, key=lambda n: (n.velocity, n.end - n.start), reverse=True)[: cfg.max_notes_per_beat]
         kept.extend(keep)
         pruned += len(beat_notes) - len(keep)
     kept.sort(key=lambda n: (n.start, n.pitch, n.end))
@@ -555,11 +604,19 @@ def _trim_hand_overlaps(
     changed = 0
     min_duration = max(0.03, cfg.min_note_beats * seconds_per_quarter)
     overlap_allowance = max(0.0, cfg.max_overlap_beats) * seconds_per_quarter
+    median_pitch = sorted(n.pitch for n in notes)[len(notes) // 2]
     for idx, group in enumerate(groups):
         next_start = groups[idx + 1][0].start if idx + 1 < len(groups) else None
         for note in group:
             end = note.end
-            if next_start is not None:
+            protected_sustain = _is_score_sustain_note(
+                note,
+                group,
+                median_pitch=median_pitch,
+                seconds_per_quarter=seconds_per_quarter,
+                cfg=cfg,
+            )
+            if next_start is not None and not protected_sustain:
                 cap = max(note.start + min_duration, next_start + overlap_allowance)
                 if end > cap:
                     end = cap
@@ -569,6 +626,25 @@ def _trim_hand_overlaps(
             trimmed.append(NoteEvent(note.pitch, note.start, end, note.velocity))
     trimmed.sort(key=lambda n: (n.start, n.pitch, n.end))
     return trimmed, changed / max(1, len(notes))
+
+
+def _is_score_sustain_note(
+    note: NoteEvent,
+    group: list[NoteEvent],
+    median_pitch: int,
+    seconds_per_quarter: float,
+    cfg: ScorePolishConfig,
+) -> bool:
+    duration_beats = (note.end - note.start) / max(1e-6, seconds_per_quarter)
+    if duration_beats < max(0.75, cfg.min_note_beats * 2.0):
+        return False
+    if cfg.protect_bass_long_notes and int(note.pitch) <= int(cfg.bass_protect_pitch):
+        return True
+    if int(note.pitch) <= int(median_pitch) + 2 and duration_beats >= 1.0:
+        return True
+    if cfg.protect_chord_tone_durations and len(group) >= 2 and duration_beats >= 1.5:
+        return True
+    return False
 
 
 def _fill_short_rests(

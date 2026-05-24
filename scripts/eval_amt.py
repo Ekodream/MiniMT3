@@ -23,6 +23,7 @@ from minimt3.amt.analysis import (
 )
 from minimt3.amt.data import DenseAMTDataset
 from minimt3.amt.decode import decode_dense_notes
+from minimt3.amt.hybrid import HybridRescueConfig, hybrid_rescue_notes
 from minimt3.amt.model import DenseAMT, DenseAMTConfig
 from minimt3.amt.presets import apply_decode_preset
 from minimt3.amt.targets import DenseTargetConfig
@@ -41,6 +42,22 @@ def main() -> None:
     parser.add_argument("--cache_dir")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--decode_preset")
+    parser.add_argument("--assistant_ckpt")
+    parser.add_argument("--assistant_decode_preset", default="v15_rescue")
+    parser.add_argument("--hybrid_rescue", action="store_true")
+    parser.add_argument("--hybrid_mode", default="chord_long")
+    parser.add_argument("--hybrid_chord_window_seconds", type=float)
+    parser.add_argument("--hybrid_long_window_seconds", type=float)
+    parser.add_argument("--hybrid_duplicate_window_seconds", type=float)
+    parser.add_argument("--hybrid_duplicate_overlap_ratio", type=float)
+    parser.add_argument("--hybrid_min_velocity", type=int)
+    parser.add_argument("--hybrid_min_duration_seconds", type=float)
+    parser.add_argument("--hybrid_long_min_duration_seconds", type=float)
+    parser.add_argument("--hybrid_bass_pitch_max", type=int)
+    parser.add_argument("--hybrid_max_added_ratio", type=float)
+    parser.add_argument("--hybrid_max_added_per_second", type=float)
+    parser.add_argument("--hybrid_max_added_per_base_onset", type=int)
+    parser.add_argument("--hybrid_max_total_notes_per_second", type=float)
     parser.add_argument("--onset_thresholds")
     parser.add_argument("--frame_thresholds")
     parser.add_argument("--offset_thresholds")
@@ -84,6 +101,22 @@ def main() -> None:
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
     target_config = DenseTargetConfig(**cfg.get("targets", {}))
+    assistant_model = None
+    assistant_decode_cfg = None
+    assistant_target_config = None
+    assistant_param_count = None
+    if args.assistant_ckpt:
+        assistant_ckpt = torch.load(args.assistant_ckpt, map_location=device)
+        assistant_cfg = assistant_ckpt["config"]
+        if dict(assistant_cfg.get("audio", {})) != dict(cfg.get("audio", {})):
+            raise ValueError("assistant_ckpt audio config must match primary ckpt for cached eval features")
+        assistant_decode_cfg = apply_decode_preset(assistant_cfg.get("decode", {}), args.assistant_decode_preset)
+        assistant_model = DenseAMT(DenseAMTConfig(**assistant_cfg.get("model", {}))).to(device)
+        assistant_model.load_state_dict(assistant_ckpt["model"], strict=False)
+        assistant_model.eval()
+        assistant_target_config = DenseTargetConfig(**assistant_cfg.get("targets", {}))
+        assistant_param_count = model_parameter_count(assistant_model)
+    hybrid_cfg = _hybrid_config_from_args(args)
     dataset = DenseAMTDataset(
         args.manifest,
         feature_config=LogMelConfig(**cfg.get("audio", {})),
@@ -187,7 +220,16 @@ def main() -> None:
             sample = dataset[idx]
             row = sample["meta"]
             duration = float(row["end_sec"]) - float(row["start_sec"])
-            out = model(sample["features"].unsqueeze(0).to(device))
+            features = sample["features"].unsqueeze(0).to(device)
+            out = model(features)
+            assistant_notes = []
+            if assistant_model is not None and assistant_decode_cfg is not None and assistant_target_config is not None:
+                assistant_notes = _decode_notes_from_config(
+                    assistant_model(features),
+                    duration=duration,
+                    decode_cfg=assistant_decode_cfg,
+                    target_config=assistant_target_config,
+                )
             ref_notes, _ = load_midi_events(row["midi"], start=float(row["start_sec"]), end=float(row["end_sec"]))
             clip_id = str(row.get("clip_id", idx))
             best_item = None
@@ -222,6 +264,9 @@ def main() -> None:
                     frame_diff_n=frame_diff_n,
                     frame_diff_scale=frame_diff_scale,
                 )
+                hybrid_stats = {}
+                if hybrid_cfg.enabled:
+                    notes, hybrid_stats = hybrid_rescue_notes(notes, assistant_notes, duration, hybrid_cfg)
                 eval_notes, eval_ref_notes = _maybe_center_crop_notes(
                     notes,
                     ref_notes,
@@ -252,14 +297,10 @@ def main() -> None:
                         metric["matches"],
                         tolerance=float(args.chord_tolerance_seconds),
                     ),
+                    "hybrid": hybrid_stats,
                     "false_positives": fps,
                     "false_negatives": fns,
                 }
-                if args.score_quality_eval:
-                    record["score_quality"] = score_quality_metrics(
-                        eval_notes,
-                        chord_tolerance_seconds=float(args.chord_tolerance_seconds),
-                    )
                 combo_item_records[combo].append(record)
                 cand = (metric["note_f1"], metric["offset_f1"], -metric["note_fp"], combo, record)
                 if best_item is None or cand[:4] > best_item[:4]:
@@ -316,6 +357,45 @@ def main() -> None:
 
     best_summary = next(row for row in grid_summaries if row["thresholds"] == best_combo)
     best_records = combo_item_records[best_combo]
+    if args.score_quality_eval:
+        _attach_score_quality_for_combo(
+            model=model,
+            dataset=dataset,
+            device=device,
+            combo=best_combo,
+            records=best_records,
+            decode_cfg=decode_cfg,
+            min_note_seconds=min_note_seconds,
+            max_notes_per_second=max_notes_per_second,
+            max_polyphony=max_polyphony,
+            min_onset_gap_seconds=min_onset_gap_seconds,
+            min_frame_at_onset=min_frame_at_onset,
+            onset_frame_fusion_weight=onset_frame_fusion_weight,
+            chord_onset_threshold=chord_onset_threshold,
+            chord_frame_threshold=chord_frame_threshold,
+            chord_window_frames=chord_window_frames,
+            chord_score_ratio=chord_score_ratio,
+            onset_peak_prominence=onset_peak_prominence,
+            max_notes_per_start_window=max_notes_per_start_window,
+            start_window_seconds=start_window_seconds,
+            use_duration_head=not args.disable_duration_head,
+            max_duration_seconds=max_duration_seconds,
+            duration_extension_weight=duration_extension_weight,
+            time_shift_clip_frames=float(target_config.time_shift_clip_frames),
+            consume_note_energy=consume_note_energy,
+            energy_neighbor_pitches=energy_neighbor_pitches,
+            energy_overlap_ratio=energy_overlap_ratio,
+            infer_onsets_from_frame_diff=infer_onsets_from_frame_diff,
+            frame_diff_n=frame_diff_n,
+            frame_diff_scale=frame_diff_scale,
+            eval_center_only=eval_center_only,
+            supervision_margin_seconds=float(target_config.supervision_margin_seconds),
+            chord_tolerance_seconds=float(args.chord_tolerance_seconds),
+            assistant_model=assistant_model,
+            assistant_decode_cfg=assistant_decode_cfg,
+            assistant_target_config=assistant_target_config,
+            hybrid_cfg=hybrid_cfg,
+        )
     report = {
         "summary": {
             "ckpt": args.ckpt,
@@ -328,6 +408,9 @@ def main() -> None:
             "param_count": model_parameter_count(model),
             "train_manifest_size": manifest_size(cfg.get("train_manifest")),
             "eval_manifest_size": manifest_size(args.manifest),
+            "assistant_ckpt": args.assistant_ckpt,
+            "assistant_decode_preset": args.assistant_decode_preset if args.assistant_ckpt else None,
+            "assistant_param_count": assistant_param_count,
             **best_summary,
         },
         "param_count": model_parameter_count(model),
@@ -345,6 +428,9 @@ def main() -> None:
             "velocity_bias": best_summary["velocity_bias"],
         },
         "score_quality": _average_nested(best_records, "score_quality") if args.score_quality_eval else {},
+        "score_notation": _average_nested(best_records, "score_notation") if args.score_quality_eval else {},
+        "hybrid_rescue": hybrid_cfg.to_json() if hybrid_cfg.enabled else {},
+        "hybrid": _average_nested(best_records, "hybrid"),
         "teacher_baseline": summarize_metric_total(teacher_total) if teacher_items else {},
         "worst_items": sorted(best_records, key=lambda item: item["metrics"]["note_f1"])[:20],
         "false_positives": _flatten_limited(best_records, "false_positives", 200),
@@ -358,6 +444,7 @@ def main() -> None:
             "disable_chord_recovery": disable_chord_recovery,
             "chord_tolerance_seconds": args.chord_tolerance_seconds,
             "duration_buckets": [label for label, _, _ in duration_buckets],
+            "assistant_decode_preset": args.assistant_decode_preset if args.assistant_ckpt else None,
         },
     }
     if args.analysis_json_out:
@@ -385,6 +472,187 @@ def _floats(value: str | float | int | list[float] | tuple[float, ...]) -> list[
     if isinstance(value, (list, tuple)):
         return [float(x) for x in value]
     return [float(x.strip()) for x in str(value).split(",") if x.strip()]
+
+
+def _decode_notes_from_config(
+    out: dict[str, torch.Tensor],
+    duration: float,
+    decode_cfg: dict[str, Any],
+    target_config: DenseTargetConfig,
+) -> list[NoteEvent]:
+    disable_chord_recovery = bool(decode_cfg.get("disable_chord_recovery", False))
+    chord_onset_threshold = None if disable_chord_recovery else decode_cfg.get("chord_onset_threshold")
+    return decode_dense_notes(
+        out,
+        duration=duration,
+        onset_threshold=float(decode_cfg.get("onset_threshold", 0.55)),
+        frame_threshold=float(decode_cfg.get("frame_threshold", 0.25)),
+        offset_threshold=float(decode_cfg.get("offset_threshold", 0.25)),
+        min_note_seconds=float(decode_cfg.get("min_note_seconds", 0.04)),
+        max_notes_per_second=float(decode_cfg.get("max_notes_per_second", 24.0)),
+        max_polyphony=int(decode_cfg.get("max_polyphony", 12)),
+        min_onset_gap_seconds=float(decode_cfg.get("min_onset_gap_seconds", 0.06)),
+        min_frame_at_onset=float(decode_cfg.get("min_frame_at_onset", 0.0)),
+        onset_frame_fusion_weight=float(decode_cfg.get("onset_frame_fusion_weight", 0.0)),
+        chord_onset_threshold=chord_onset_threshold,
+        chord_frame_threshold=float(decode_cfg.get("chord_frame_threshold", 0.35)),
+        chord_window_frames=int(decode_cfg.get("chord_window_frames", 1)),
+        chord_score_ratio=float(decode_cfg.get("chord_score_ratio", 0.75)),
+        onset_peak_prominence=float(decode_cfg.get("onset_peak_prominence", 0.0)),
+        max_notes_per_start_window=decode_cfg.get("max_notes_per_start_window"),
+        start_window_seconds=float(decode_cfg.get("start_window_seconds", 0.08)),
+        use_duration_head=not bool(decode_cfg.get("disable_duration_head", False)),
+        max_duration_seconds=float(decode_cfg.get("max_duration_seconds", 8.0)),
+        duration_extension_weight=float(decode_cfg.get("duration_extension_weight", 1.0)),
+        time_shift_clip_frames=float(target_config.time_shift_clip_frames),
+        consume_note_energy=bool(decode_cfg.get("consume_note_energy", False)),
+        energy_neighbor_pitches=int(decode_cfg.get("energy_neighbor_pitches", 1)),
+        energy_overlap_ratio=float(decode_cfg.get("energy_overlap_ratio", 0.5)),
+        infer_onsets_from_frame_diff=bool(decode_cfg.get("infer_onsets_from_frame_diff", False)),
+        frame_diff_n=int(decode_cfg.get("frame_diff_n", 2)),
+        frame_diff_scale=float(decode_cfg.get("frame_diff_scale", 1.0)),
+    )
+
+
+def _hybrid_config_from_args(args: argparse.Namespace) -> HybridRescueConfig:
+    defaults = HybridRescueConfig()
+    return HybridRescueConfig(
+        enabled=bool(args.hybrid_rescue and args.assistant_ckpt),
+        mode=str(args.hybrid_mode or defaults.mode),
+        chord_window_seconds=_arg_or_default(args.hybrid_chord_window_seconds, defaults.chord_window_seconds),
+        long_window_seconds=_arg_or_default(args.hybrid_long_window_seconds, defaults.long_window_seconds),
+        duplicate_window_seconds=_arg_or_default(
+            args.hybrid_duplicate_window_seconds,
+            defaults.duplicate_window_seconds,
+        ),
+        duplicate_overlap_ratio=_arg_or_default(
+            args.hybrid_duplicate_overlap_ratio,
+            defaults.duplicate_overlap_ratio,
+        ),
+        min_velocity=int(_arg_or_default(args.hybrid_min_velocity, defaults.min_velocity)),
+        min_duration_seconds=_arg_or_default(args.hybrid_min_duration_seconds, defaults.min_duration_seconds),
+        long_min_duration_seconds=_arg_or_default(
+            args.hybrid_long_min_duration_seconds,
+            defaults.long_min_duration_seconds,
+        ),
+        bass_pitch_max=int(_arg_or_default(args.hybrid_bass_pitch_max, defaults.bass_pitch_max)),
+        max_added_ratio=_arg_or_default(args.hybrid_max_added_ratio, defaults.max_added_ratio),
+        max_added_per_second=_arg_or_default(args.hybrid_max_added_per_second, defaults.max_added_per_second),
+        max_added_per_base_onset=int(
+            _arg_or_default(args.hybrid_max_added_per_base_onset, defaults.max_added_per_base_onset)
+        ),
+        max_total_notes_per_second=_arg_or_default(
+            args.hybrid_max_total_notes_per_second,
+            defaults.max_total_notes_per_second,
+        ),
+    )
+
+
+def _arg_or_default(value, default):
+    return default if value is None else value
+
+
+@torch.no_grad()
+def _attach_score_quality_for_combo(
+    model: DenseAMT,
+    dataset: DenseAMTDataset,
+    device: torch.device,
+    combo: tuple[float, float, float],
+    records: list[dict[str, Any]],
+    decode_cfg: dict[str, Any],
+    min_note_seconds: float,
+    max_notes_per_second: float,
+    max_polyphony: int,
+    min_onset_gap_seconds: float,
+    min_frame_at_onset: float,
+    onset_frame_fusion_weight: float,
+    chord_onset_threshold: float | None,
+    chord_frame_threshold: float,
+    chord_window_frames: int,
+    chord_score_ratio: float,
+    onset_peak_prominence: float,
+    max_notes_per_start_window: int | None,
+    start_window_seconds: float,
+    use_duration_head: bool,
+    max_duration_seconds: float,
+    duration_extension_weight: float,
+    time_shift_clip_frames: float,
+    consume_note_energy: bool,
+    energy_neighbor_pitches: int,
+    energy_overlap_ratio: float,
+    infer_onsets_from_frame_diff: bool,
+    frame_diff_n: int,
+    frame_diff_scale: float,
+    eval_center_only: bool,
+    supervision_margin_seconds: float,
+    chord_tolerance_seconds: float,
+    assistant_model: DenseAMT | None = None,
+    assistant_decode_cfg: dict[str, Any] | None = None,
+    assistant_target_config: DenseTargetConfig | None = None,
+    hybrid_cfg: HybridRescueConfig | None = None,
+) -> None:
+    del decode_cfg
+    records_by_index = {int(record["index"]): record for record in records}
+    for idx in range(len(dataset)):
+        record = records_by_index.get(idx)
+        if record is None:
+            continue
+        sample = dataset[idx]
+        row = sample["meta"]
+        duration = float(row["end_sec"]) - float(row["start_sec"])
+        features = sample["features"].unsqueeze(0).to(device)
+        out = model(features)
+        notes = decode_dense_notes(
+            out,
+            duration=duration,
+            onset_threshold=combo[0],
+            frame_threshold=combo[1],
+            offset_threshold=combo[2],
+            min_note_seconds=min_note_seconds,
+            max_notes_per_second=max_notes_per_second,
+            max_polyphony=max_polyphony,
+            min_onset_gap_seconds=min_onset_gap_seconds,
+            min_frame_at_onset=min_frame_at_onset,
+            onset_frame_fusion_weight=onset_frame_fusion_weight,
+            chord_onset_threshold=chord_onset_threshold,
+            chord_frame_threshold=chord_frame_threshold,
+            chord_window_frames=chord_window_frames,
+            chord_score_ratio=chord_score_ratio,
+            onset_peak_prominence=onset_peak_prominence,
+            max_notes_per_start_window=max_notes_per_start_window,
+            start_window_seconds=start_window_seconds,
+            use_duration_head=use_duration_head,
+            max_duration_seconds=max_duration_seconds,
+            duration_extension_weight=duration_extension_weight,
+            time_shift_clip_frames=time_shift_clip_frames,
+            consume_note_energy=consume_note_energy,
+            energy_neighbor_pitches=energy_neighbor_pitches,
+            energy_overlap_ratio=energy_overlap_ratio,
+            infer_onsets_from_frame_diff=infer_onsets_from_frame_diff,
+            frame_diff_n=frame_diff_n,
+            frame_diff_scale=frame_diff_scale,
+        )
+        if hybrid_cfg is not None and hybrid_cfg.enabled and assistant_model is not None and assistant_decode_cfg is not None:
+            assistant_notes = _decode_notes_from_config(
+                assistant_model(features),
+                duration=duration,
+                decode_cfg=assistant_decode_cfg,
+                target_config=assistant_target_config or DenseTargetConfig(),
+            )
+            notes, hybrid_stats = hybrid_rescue_notes(notes, assistant_notes, duration, hybrid_cfg)
+            record["hybrid"] = hybrid_stats
+        eval_notes, _ = _maybe_center_crop_notes(
+            notes,
+            [],
+            duration,
+            supervision_margin_seconds,
+            eval_center_only,
+        )
+        record["score_quality"] = score_quality_metrics(
+            eval_notes,
+            chord_tolerance_seconds=chord_tolerance_seconds,
+        )
+        record["score_notation"] = record["score_quality"].get("score_notation", {})
 
 
 def selection_score(note_f1: float, offset_f1: float, pred_ref_ratio: float) -> float:

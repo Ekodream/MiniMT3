@@ -313,9 +313,14 @@ def chord_metrics(
     }
 
 
-def score_quality_metrics(notes: list[NoteEvent], chord_tolerance_seconds: float = 0.075) -> dict[str, float]:
+def score_quality_metrics(notes: list[NoteEvent], chord_tolerance_seconds: float = 0.075) -> dict[str, Any]:
     if not notes:
-        return {"raw_notes": 0.0, "score_notes": 0.0, "score_pruned_rate": 0.0}
+        return {
+            "raw_notes": 0.0,
+            "score_notes": 0.0,
+            "score_pruned_rate": 0.0,
+            "score_notation": score_notation_report([], performance_note_count=0),
+        }
     try:
         from minimt3.symbolic.score_polish import ScorePolishConfig, polish_score_notes
     except Exception:
@@ -333,7 +338,47 @@ def score_quality_metrics(notes: list[NoteEvent], chord_tolerance_seconds: float
     metrics["raw_notes"] = float(len(notes))
     metrics["score_notes"] = float(len(result.notes))
     metrics["score_pruned_rate"] = max(0.0, 1.0 - len(result.notes) / max(1, len(notes)))
+    metrics["score_notation"] = score_notation_report(
+        result.notes,
+        seconds_per_quarter=result.seconds_per_quarter,
+        key_signature=result.key_signature,
+        time_signature=result.time_signature,
+        right_notes=result.right_notes,
+        left_notes=result.left_notes,
+        beat_divisions=result.beat_divisions,
+        performance_note_count=len(notes),
+    )
     return metrics
+
+
+def score_notation_report(
+    notes: list[NoteEvent],
+    seconds_per_quarter: float = 0.5,
+    key_signature: str | None = None,
+    time_signature: str = "4/4",
+    right_notes: list[NoteEvent] | None = None,
+    left_notes: list[NoteEvent] | None = None,
+    beat_divisions: tuple[int, ...] = (4,),
+    performance_note_count: int | None = None,
+    key_signature_source: str = "auto",
+    time_signature_source: str = "auto",
+) -> dict[str, Any]:
+    try:
+        from minimt3.symbolic.score_render import score_notation_metrics
+    except Exception:
+        return {}
+    return score_notation_metrics(
+        notes,
+        seconds_per_quarter=seconds_per_quarter,
+        key_signature=key_signature,
+        time_signature=time_signature,
+        right_notes=right_notes,
+        left_notes=left_notes,
+        beat_divisions=beat_divisions,
+        performance_note_count=performance_note_count,
+        key_signature_source=key_signature_source,
+        time_signature_source=time_signature_source,
+    )
 
 
 def error_records(

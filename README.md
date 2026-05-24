@@ -368,6 +368,20 @@ The first-stage config is `configs/train_amt_v13_large_finetune.yaml`. It initia
 with a small decode-threshold sweep. If two v13 fine-tunes do not improve the calibrated validation set meaningfully,
 switch to `configs/train_amt_v14_mid.yaml` instead of continuing to lower LR indefinitely.
 
+For the next note-F1-first run, use v15. The default v15 path keeps the v13 backbone scale, adds duration supervision,
+adds one lightweight attention-context block, enables SpecAugment-style feature masking, and selects checkpoints with
+precision/recall-aware decode sweeps:
+
+```bash
+PROFILE=f1_duration LAUNCH_TRAIN=1 bash scripts/remote_start_v15_f1.sh
+```
+
+Only use the larger fallback after the v15 duration run is evaluated:
+
+```bash
+PROFILE=xlarge_duration LAUNCH_TRAIN=1 bash scripts/remote_start_v15_f1.sh
+```
+
 Report model scale and manifest size:
 
 ```bash
@@ -375,7 +389,9 @@ python scripts/amt_model_report.py \
   --config configs/train_amt_v12_crnn_bytedance.yaml \
   --config configs/train_amt_v13_wide.yaml \
   --config configs/train_amt_v13_large_finetune.yaml \
-  --config configs/train_amt_v14_mid.yaml
+  --config configs/train_amt_v14_mid.yaml \
+  --config configs/train_amt_v15_f1_duration.yaml \
+  --config configs/train_amt_v15_xlarge_duration.yaml
 ```
 
 Run diagnostic eval with precision/recall, duration buckets, chord metrics, velocity error, score-quality metrics, and
@@ -394,6 +410,23 @@ python scripts/eval_amt.py \
 
 For student transcription, `scripts/infer_amt.py` now defaults to `--decode_preset practice_score`, which favors clean,
 readable MusicXML. Use `--decode_preset analysis_midi` or `--decode_preset v13_recall` for higher-recall debugging.
+
+For the current v13/v15 mainline comparison on the remote host, keep the running training session untouched and launch
+the single-GPU eval in a separate tmux session:
+
+```bash
+LAUNCH_EVAL=1 bash scripts/remote_eval_v13_v15.sh
+```
+
+For the Test_new score-quality comparison, use the fixed output root below instead of ad-hoc temporary folders:
+
+```bash
+LAUNCH_DEMO=1 bash scripts/remote_run_test_new_compare.sh
+```
+
+The score renderer is measure-aware across both piano staves. It hides filler rests in active measures, keeps visible
+full-measure rests only when a staff is genuinely silent, protects sustained bass/inner voices from overlap trimming,
+and locks near-onset chord groups before MusicXML rendering.
 
 Legacy seq2seq training is still available:
 

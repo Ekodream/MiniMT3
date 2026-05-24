@@ -31,11 +31,19 @@ def main() -> None:
         "overlap_trim_rate": 0.0,
         "chord_collapse_rate": 0.0,
         "hand_crossings": 0.0,
+        "rest_density": 0.0,
+        "visible_rest_count": 0.0,
+        "long_note_tie_rate": 0.0,
+        "voice_collision_count": 0.0,
+        "chord_verticality": 0.0,
+        "secondary_voice_notes": 0.0,
+        "score_notes_per_performance_note": 0.0,
     }
     for path in debug_paths:
         data = read_json(path)
         score = data.get("score_polish") or {}
         metrics = score.get("metrics") or {}
+        notation = data.get("score_notation") or {}
         musicxml_path = data.get("musicxml")
         ok = False
         if musicxml_path:
@@ -57,10 +65,20 @@ def main() -> None:
             "hand_crossings",
         ):
             totals[key] += float(metrics.get(key, 0.0))
+        for key in (
+            "rest_density",
+            "visible_rest_count",
+            "long_note_tie_rate",
+            "chord_verticality",
+            "voice_collision_count",
+            "secondary_voice_notes",
+            "score_notes_per_performance_note",
+        ):
+            totals[key] += float(notation.get(key, 0.0))
         print(
             "score_item "
             f"path={path} musicxml_ok={ok} notes={data.get('notes', 0)} score_notes={data.get('score_notes', 0)} "
-            f"key={score.get('key_signature')} tempo={score.get('tempo_bpm')} metrics={metrics}",
+            f"key={score.get('key_signature')} tempo={score.get('tempo_bpm')} metrics={metrics} notation={notation}",
             flush=True,
         )
 
@@ -74,7 +92,14 @@ def main() -> None:
         f"avg_density_pruned_rate={totals['density_pruned_rate'] / count:.4f} "
         f"avg_overlap_trim_rate={totals['overlap_trim_rate'] / count:.4f} "
         f"avg_chord_collapse_rate={totals['chord_collapse_rate'] / count:.4f} "
-        f"avg_hand_crossings={totals['hand_crossings'] / count:.2f}",
+        f"avg_hand_crossings={totals['hand_crossings'] / count:.2f} "
+        f"avg_rest_density={totals['rest_density'] / count:.3f} "
+        f"avg_visible_rests={totals['visible_rest_count'] / count:.1f} "
+        f"avg_long_note_tie_rate={totals['long_note_tie_rate'] / count:.3f} "
+        f"avg_chord_verticality={totals['chord_verticality'] / count:.3f} "
+        f"avg_voice_collisions={totals['voice_collision_count'] / count:.1f} "
+        f"avg_secondary_voice_notes={totals['secondary_voice_notes'] / count:.1f} "
+        f"avg_score_perf_ratio={totals['score_notes_per_performance_note'] / count:.3f}",
         flush=True,
     )
 

@@ -88,6 +88,9 @@ def main() -> None:
 
     model_cfg = DenseAMTConfig(**cfg.get("model", {}))
     model = DenseAMT(model_cfg).to(device)
+    if rank == 0:
+        params = sum(param.numel() for param in model.parameters())
+        print(f"amt_model params={params / 1e6:.2f}M architecture={model_cfg.architecture}", flush=True)
     if cfg.get("init_from"):
         load_compatible_weights(
             cfg["init_from"],
@@ -138,6 +141,7 @@ def main() -> None:
             if max_steps and global_step >= max_steps:
                 break
             features = batch["features"].to(device, non_blocking=True)
+            features = apply_feature_augmentation(features, cfg)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 model_out = model(features)
@@ -163,7 +167,7 @@ def main() -> None:
                     val = evaluate(eval_model, val_loader, criterion, device, use_amp, amp_dtype, cfg)
                     print(f"step={global_step} val_loss={val['loss']:.4f} {val['losses']}", flush=True)
                     debug = debug_decode(eval_model, val_ds, device, cfg, global_step)
-                    score = selection_score(debug)
+                    score = selection_score(debug, cfg)
                     print(f"checkpoint_selection score={score:.5f} best={best_score:.5f}", flush=True)
                     min_delta = float(cfg.get("early_stop_min_delta", 1e-5))
                     improved = score > best_score + min_delta
@@ -229,6 +233,54 @@ def evaluate(model, loader, criterion, device, use_amp: bool, amp_dtype: torch.d
     return {"loss": sum(losses) / max(1, len(losses)), "losses": {k: sum(v) / len(v) for k, v in logs.items()}}
 
 
+def apply_feature_augmentation(features: torch.Tensor, cfg: dict[str, Any]) -> torch.Tensor:
+    aug = cfg.get("augment", {})
+    if not bool(aug.get("enabled", False)):
+        return features
+    out = features
+    gain_range = aug.get("gain_range")
+    if isinstance(gain_range, (list, tuple)) and len(gain_range) == 2:
+        lo, hi = float(gain_range[0]), float(gain_range[1])
+        if hi > lo:
+            gains = torch.empty(out.shape[0], 1, 1, device=out.device, dtype=out.dtype).uniform_(lo, hi)
+            out = (out * gains).clamp(0.0, 1.0)
+    noise_std = float(aug.get("noise_std", 0.0) or 0.0)
+    if noise_std > 0.0:
+        out = (out + torch.randn_like(out) * noise_std).clamp(0.0, 1.0)
+    freq_masks = int(aug.get("freq_masks", 0) or 0)
+    freq_max = int(aug.get("freq_mask_max_bins", 0) or 0)
+    time_masks = int(aug.get("time_masks", 0) or 0)
+    time_max = int(aug.get("time_mask_max_frames", 0) or 0)
+    time_ratio = float(aug.get("time_mask_max_ratio", 1.0) or 1.0)
+    mask_value = float(aug.get("mask_value", 0.0))
+    if freq_masks <= 0 and time_masks <= 0:
+        return out
+    out = out.clone()
+    batch, n_mels, frames = out.shape
+    max_time_width = max(0, min(time_max, int(frames * max(0.0, time_ratio))))
+    for b in range(batch):
+        for _ in range(freq_masks):
+            width = _rand_width(freq_max, device=out.device)
+            if width <= 0 or width >= n_mels:
+                continue
+            start = int(torch.randint(0, n_mels - width + 1, (1,), device=out.device).item())
+            out[b, start : start + width, :] = mask_value
+        for _ in range(time_masks):
+            width = _rand_width(max_time_width, device=out.device)
+            if width <= 0 or width >= frames:
+                continue
+            start = int(torch.randint(0, frames - width + 1, (1,), device=out.device).item())
+            out[b, :, start : start + width] = mask_value
+    return out
+
+
+def _rand_width(max_width: int, device: torch.device) -> int:
+    max_width = int(max_width)
+    if max_width <= 0:
+        return 0
+    return int(torch.randint(1, max_width + 1, (1,), device=device).item())
+
+
 @torch.no_grad()
 def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], step: int) -> dict[str, float]:
     was_training = model.training
@@ -237,7 +289,17 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
     combos = _debug_decode_combos(cfg, decode_cfg)
     max_items = min(int(cfg.get("debug_items", 8)), len(dataset))
     totals = {
-        combo: {"note_f1": 0.0, "offset_f1": 0.0, "pred": 0, "ref": 0, "bad_clips": 0}
+        combo: {
+            "note_precision": 0.0,
+            "note_recall": 0.0,
+            "note_f1": 0.0,
+            "offset_precision": 0.0,
+            "offset_recall": 0.0,
+            "offset_f1": 0.0,
+            "pred": 0,
+            "ref": 0,
+            "bad_clips": 0,
+        }
         for combo in combos
     }
     for idx in range(max_items):
@@ -284,7 +346,11 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
             )
             eval_notes, eval_ref_notes = _maybe_center_crop_notes(notes, ref_notes, row, cfg)
             metric = note_metrics(eval_notes, eval_ref_notes)
+            totals[combo]["note_precision"] += metric["note_precision"]
+            totals[combo]["note_recall"] += metric["note_recall"]
             totals[combo]["note_f1"] += metric["note_f1"]
+            totals[combo]["offset_precision"] += metric["offset_precision"]
+            totals[combo]["offset_recall"] += metric["offset_recall"]
             totals[combo]["offset_f1"] += metric["offset_f1"]
             totals[combo]["pred"] += len(eval_notes)
             totals[combo]["ref"] += len(eval_ref_notes)
@@ -307,7 +373,11 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
     for combo, values in sorted(totals.items()):
         pred_ref = values["pred"] / max(1, values["ref"])
         summary = {
+            "note_precision": values["note_precision"] / count,
+            "note_recall": values["note_recall"] / count,
             "note_f1": values["note_f1"] / count,
+            "offset_precision": values["offset_precision"] / count,
+            "offset_recall": values["offset_recall"] / count,
             "offset_f1": values["offset_f1"] / count,
             "pred_ref_ratio": pred_ref,
             "bad_clip_rate": values["bad_clips"] / count,
@@ -315,11 +385,12 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
             "ref_notes": values["ref"],
             "thresholds": combo,
         }
-        score = selection_score(summary)
+        score = selection_score(summary, cfg)
         if len(combos) > 1:
             print(
                 "debug_amt_sweep "
                 f"step={step} thresholds={combo} note_f1={summary['note_f1']:.4f} "
+                f"note_p={summary['note_precision']:.4f} note_r={summary['note_recall']:.4f} "
                 f"offset_f1={summary['offset_f1']:.4f} pred_ref_ratio={pred_ref:.3f} "
                 f"score={score:.5f}",
                 flush=True,
@@ -332,6 +403,8 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
         "debug_amt_summary "
         f"step={step} thresholds={best_summary['thresholds']} "
         f"note_f1={best_summary['note_f1']:.4f} offset_f1={best_summary['offset_f1']:.4f} "
+        f"note_p={best_summary['note_precision']:.4f} note_r={best_summary['note_recall']:.4f} "
+        f"offset_p={best_summary['offset_precision']:.4f} offset_r={best_summary['offset_recall']:.4f} "
         f"pred_ref_ratio={best_summary['pred_ref_ratio']:.3f} bad_clip_rate={best_summary['bad_clip_rate']:.3f} "
         f"pred_notes={best_summary['pred_notes']} ref_notes={best_summary['ref_notes']}",
         flush=True,
@@ -365,20 +438,23 @@ def _float_values(value: Any) -> list[float]:
     return [float(part.strip()) for part in str(value).split(",") if part.strip()]
 
 
-def selection_score(debug: dict[str, float]) -> float:
+def selection_score(debug: dict[str, float], cfg: dict[str, Any] | None = None) -> float:
+    selection = (cfg or {}).get("selection", {})
     pred_ref_ratio = float(debug.get("pred_ref_ratio", 0.0))
     if pred_ref_ratio <= 0:
         return -math.inf
     ratio_error = abs(math.log(max(1e-6, pred_ref_ratio)))
-    over_generation = max(0.0, pred_ref_ratio - 1.35)
-    under_generation = max(0.0, 0.55 - pred_ref_ratio)
+    over_generation = max(0.0, pred_ref_ratio - float(selection.get("over_generation_ratio", 1.35)))
+    under_generation = max(0.0, float(selection.get("under_generation_ratio", 0.55)) - pred_ref_ratio)
     return (
-        10.0 * float(debug.get("note_f1", 0.0))
-        + float(debug.get("offset_f1", 0.0))
-        - 1.15 * ratio_error
-        - 0.65 * over_generation
-        - 0.35 * under_generation
-        - 1.0 * float(debug.get("bad_clip_rate", 0.0))
+        float(selection.get("note_f1_weight", 10.0)) * float(debug.get("note_f1", 0.0))
+        + float(selection.get("note_recall_weight", 0.0)) * float(debug.get("note_recall", 0.0))
+        + float(selection.get("note_precision_weight", 0.0)) * float(debug.get("note_precision", 0.0))
+        + float(selection.get("offset_f1_weight", 1.0)) * float(debug.get("offset_f1", 0.0))
+        - float(selection.get("ratio_log_penalty", 1.15)) * ratio_error
+        - float(selection.get("over_generation_penalty", 0.65)) * over_generation
+        - float(selection.get("under_generation_penalty", 0.35)) * under_generation
+        - float(selection.get("bad_clip_penalty", 1.0)) * float(debug.get("bad_clip_rate", 0.0))
     )
 
 
@@ -404,7 +480,14 @@ def note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dic
         pred_pitches,
         offset_ratio=0.2,
     )
-    return {"note_f1": float(onset[2]), "offset_f1": float(offset[2])}
+    return {
+        "note_precision": float(onset[0]),
+        "note_recall": float(onset[1]),
+        "note_f1": float(onset[2]),
+        "offset_precision": float(offset[0]),
+        "offset_recall": float(offset[1]),
+        "offset_f1": float(offset[2]),
+    }
 
 
 def note_arrays(notes: list[NoteEvent], np_module):
@@ -449,7 +532,14 @@ def simple_note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent])
     precision = hits / max(1, len(pred_notes))
     recall = hits / max(1, len(ref_notes))
     f1 = 2 * precision * recall / max(1e-8, precision + recall)
-    return {"note_f1": f1, "offset_f1": 0.0}
+    return {
+        "note_precision": precision,
+        "note_recall": recall,
+        "note_f1": f1,
+        "offset_precision": 0.0,
+        "offset_recall": 0.0,
+        "offset_f1": 0.0,
+    }
 
 
 def load_compatible_weights(path, model: DenseAMT, device, rank: int, expand: bool = False) -> None:
