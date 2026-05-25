@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from minimt3.amt.calibration import load_pitch_threshold_bias, summarize_pitch_threshold_bias
 from minimt3.amt.analysis import (
     add_metric_total,
     chord_metrics,
@@ -23,7 +24,7 @@ from minimt3.amt.analysis import (
 )
 from minimt3.amt.data import DenseAMTDataset
 from minimt3.amt.decode import decode_dense_notes
-from minimt3.amt.hybrid import HybridRescueConfig, hybrid_rescue_notes
+from minimt3.amt.hybrid import HybridRescueConfig, hybrid_rescue_notes, resolve_hybrid_preset
 from minimt3.amt.model import DenseAMT, DenseAMTConfig
 from minimt3.amt.presets import apply_decode_preset
 from minimt3.amt.targets import DenseTargetConfig
@@ -45,7 +46,8 @@ def main() -> None:
     parser.add_argument("--assistant_ckpt")
     parser.add_argument("--assistant_decode_preset", default="v15_rescue")
     parser.add_argument("--hybrid_rescue", action="store_true")
-    parser.add_argument("--hybrid_mode", default="chord_long")
+    parser.add_argument("--hybrid_preset", default="default")
+    parser.add_argument("--hybrid_mode")
     parser.add_argument("--hybrid_chord_window_seconds", type=float)
     parser.add_argument("--hybrid_long_window_seconds", type=float)
     parser.add_argument("--hybrid_duplicate_window_seconds", type=float)
@@ -58,6 +60,14 @@ def main() -> None:
     parser.add_argument("--hybrid_max_added_per_second", type=float)
     parser.add_argument("--hybrid_max_added_per_base_onset", type=int)
     parser.add_argument("--hybrid_max_total_notes_per_second", type=float)
+    parser.add_argument("--hybrid_disable_long_extension", action="store_true")
+    parser.add_argument("--hybrid_extension_window_seconds", type=float)
+    parser.add_argument("--hybrid_extension_min_gain_seconds", type=float)
+    parser.add_argument("--hybrid_extension_min_duration_seconds", type=float)
+    parser.add_argument("--hybrid_extension_max_gain_seconds", type=float)
+    parser.add_argument("--hybrid_extension_pitch_max", type=int)
+    parser.add_argument("--pitch_calibration_json")
+    parser.add_argument("--assistant_pitch_calibration_json")
     parser.add_argument("--onset_thresholds")
     parser.add_argument("--frame_thresholds")
     parser.add_argument("--offset_thresholds")
@@ -129,6 +139,8 @@ def main() -> None:
         assistant_target_config = DenseTargetConfig(**assistant_cfg.get("targets", {}))
         assistant_param_count = model_parameter_count(assistant_model)
     hybrid_cfg = _hybrid_config_from_args(args)
+    pitch_threshold_bias = load_pitch_threshold_bias(args.pitch_calibration_json)
+    assistant_pitch_threshold_bias = load_pitch_threshold_bias(args.assistant_pitch_calibration_json)
     dataset = DenseAMTDataset(
         args.manifest,
         feature_config=LogMelConfig(**cfg.get("audio", {})),
@@ -266,6 +278,7 @@ def main() -> None:
                     duration=duration,
                     decode_cfg=assistant_decode_cfg,
                     target_config=assistant_target_config,
+                    pitch_threshold_bias=assistant_pitch_threshold_bias,
                 )
             ref_notes, _ = load_midi_events(row["midi"], start=float(row["start_sec"]), end=float(row["end_sec"]))
             clip_id = str(row.get("clip_id", idx))
@@ -304,6 +317,7 @@ def main() -> None:
                     frame_diff_context_threshold=frame_diff_context_threshold,
                     frame_diff_context_window_frames=frame_diff_context_window_frames,
                     frame_diff_context_min_pitches=frame_diff_context_min_pitches,
+                    pitch_threshold_bias=pitch_threshold_bias,
                 )
                 hybrid_stats = {}
                 if hybrid_cfg.enabled:
@@ -453,6 +467,8 @@ def main() -> None:
             assistant_decode_cfg=assistant_decode_cfg,
             assistant_target_config=assistant_target_config,
             hybrid_cfg=hybrid_cfg,
+            pitch_threshold_bias=pitch_threshold_bias,
+            assistant_pitch_threshold_bias=assistant_pitch_threshold_bias,
         )
     report = {
         "summary": {
@@ -496,6 +512,8 @@ def main() -> None:
         "score_notation": _average_nested(best_records, "score_notation") if args.score_quality_eval else {},
         "hybrid_rescue": hybrid_cfg.to_json() if hybrid_cfg.enabled else {},
         "hybrid": _average_nested(best_records, "hybrid"),
+        "pitch_calibration_summary": summarize_pitch_threshold_bias(pitch_threshold_bias),
+        "assistant_pitch_calibration_summary": summarize_pitch_threshold_bias(assistant_pitch_threshold_bias),
         "teacher_baseline": summarize_metric_total(teacher_total) if teacher_items else {},
         "pitch_calibration": _pitch_calibration(best_records),
         "worst_items": sorted(best_records, key=lambda item: item["metrics"]["note_f1"])[:20],
@@ -617,6 +635,7 @@ def _decode_notes_from_config(
     duration: float,
     decode_cfg: dict[str, Any],
     target_config: DenseTargetConfig,
+    pitch_threshold_bias: dict[int, float] | None = None,
 ) -> list[NoteEvent]:
     disable_chord_recovery = bool(decode_cfg.get("disable_chord_recovery", False))
     chord_onset_threshold = None if disable_chord_recovery else decode_cfg.get("chord_onset_threshold")
@@ -653,11 +672,12 @@ def _decode_notes_from_config(
         frame_diff_context_threshold=float(decode_cfg.get("frame_diff_context_threshold", 0.0)),
         frame_diff_context_window_frames=int(decode_cfg.get("frame_diff_context_window_frames", 0)),
         frame_diff_context_min_pitches=int(decode_cfg.get("frame_diff_context_min_pitches", 0)),
+        pitch_threshold_bias=pitch_threshold_bias,
     )
 
 
 def _hybrid_config_from_args(args: argparse.Namespace) -> HybridRescueConfig:
-    defaults = HybridRescueConfig()
+    defaults = resolve_hybrid_preset(args.hybrid_preset)
     return HybridRescueConfig(
         enabled=bool(args.hybrid_rescue and args.assistant_ckpt),
         mode=str(args.hybrid_mode or defaults.mode),
@@ -687,6 +707,24 @@ def _hybrid_config_from_args(args: argparse.Namespace) -> HybridRescueConfig:
             args.hybrid_max_total_notes_per_second,
             defaults.max_total_notes_per_second,
         ),
+        extend_duplicate_long_notes=bool(defaults.extend_duplicate_long_notes and not args.hybrid_disable_long_extension),
+        extension_window_seconds=_arg_or_default(
+            args.hybrid_extension_window_seconds,
+            defaults.extension_window_seconds,
+        ),
+        extension_min_gain_seconds=_arg_or_default(
+            args.hybrid_extension_min_gain_seconds,
+            defaults.extension_min_gain_seconds,
+        ),
+        extension_min_duration_seconds=_arg_or_default(
+            args.hybrid_extension_min_duration_seconds,
+            defaults.extension_min_duration_seconds,
+        ),
+        extension_max_gain_seconds=_arg_or_default(
+            args.hybrid_extension_max_gain_seconds,
+            defaults.extension_max_gain_seconds,
+        ),
+        extension_pitch_max=int(_arg_or_default(args.hybrid_extension_pitch_max, defaults.extension_pitch_max)),
     )
 
 
@@ -737,6 +775,8 @@ def _attach_score_quality_for_combo(
     assistant_decode_cfg: dict[str, Any] | None = None,
     assistant_target_config: DenseTargetConfig | None = None,
     hybrid_cfg: HybridRescueConfig | None = None,
+    pitch_threshold_bias: dict[int, float] | None = None,
+    assistant_pitch_threshold_bias: dict[int, float] | None = None,
 ) -> None:
     del decode_cfg
     records_by_index = {int(record["index"]): record for record in records}
@@ -785,6 +825,7 @@ def _attach_score_quality_for_combo(
             frame_diff_context_threshold=frame_diff_context_threshold,
             frame_diff_context_window_frames=frame_diff_context_window_frames,
             frame_diff_context_min_pitches=frame_diff_context_min_pitches,
+            pitch_threshold_bias=pitch_threshold_bias,
         )
         if hybrid_cfg is not None and hybrid_cfg.enabled and assistant_model is not None and assistant_decode_cfg is not None:
             assistant_notes = _decode_notes_from_config(
@@ -792,6 +833,7 @@ def _attach_score_quality_for_combo(
                 duration=duration,
                 decode_cfg=assistant_decode_cfg,
                 target_config=assistant_target_config or DenseTargetConfig(),
+                pitch_threshold_bias=assistant_pitch_threshold_bias,
             )
             notes, hybrid_stats = hybrid_rescue_notes(notes, assistant_notes, duration, hybrid_cfg)
             record["hybrid"] = hybrid_stats

@@ -6,8 +6,9 @@ from pathlib import Path
 
 import torch
 
+from minimt3.amt.calibration import load_pitch_threshold_bias, summarize_pitch_threshold_bias
 from minimt3.amt.decode import decode_dense_notes, decode_dense_pedals
-from minimt3.amt.hybrid import HybridRescueConfig, hybrid_rescue_notes
+from minimt3.amt.hybrid import HybridRescueConfig, hybrid_rescue_notes, resolve_hybrid_preset
 from minimt3.amt.model import DenseAMT, DenseAMTConfig
 from minimt3.amt.presets import apply_decode_preset, apply_score_preset
 from minimt3.audio.features import LogMelConfig, LogMelExtractor
@@ -34,7 +35,8 @@ def main() -> None:
     parser.add_argument("--assistant_ckpt")
     parser.add_argument("--assistant_decode_preset", default="v15_rescue")
     parser.add_argument("--hybrid_rescue", action="store_true")
-    parser.add_argument("--hybrid_mode", default="chord_long")
+    parser.add_argument("--hybrid_preset", default="default")
+    parser.add_argument("--hybrid_mode")
     parser.add_argument("--hybrid_chord_window_seconds", type=float)
     parser.add_argument("--hybrid_long_window_seconds", type=float)
     parser.add_argument("--hybrid_duplicate_window_seconds", type=float)
@@ -47,6 +49,14 @@ def main() -> None:
     parser.add_argument("--hybrid_max_added_per_second", type=float)
     parser.add_argument("--hybrid_max_added_per_base_onset", type=int)
     parser.add_argument("--hybrid_max_total_notes_per_second", type=float)
+    parser.add_argument("--hybrid_disable_long_extension", action="store_true")
+    parser.add_argument("--hybrid_extension_window_seconds", type=float)
+    parser.add_argument("--hybrid_extension_min_gain_seconds", type=float)
+    parser.add_argument("--hybrid_extension_min_duration_seconds", type=float)
+    parser.add_argument("--hybrid_extension_max_gain_seconds", type=float)
+    parser.add_argument("--hybrid_extension_pitch_max", type=int)
+    parser.add_argument("--pitch_calibration_json")
+    parser.add_argument("--assistant_pitch_calibration_json")
     parser.add_argument("--window_seconds", type=float)
     parser.add_argument("--overlap_seconds", type=float)
     parser.add_argument("--onset_threshold", type=float)
@@ -335,6 +345,8 @@ def main() -> None:
         if args.score_chord_lock_max_duration_spread_beats is not None
         else score_cfg.get("score_chord_lock_max_duration_spread_beats", 0.75)
     )
+    pitch_threshold_bias = load_pitch_threshold_bias(args.pitch_calibration_json)
+    assistant_pitch_threshold_bias = load_pitch_threshold_bias(args.assistant_pitch_calibration_json)
     audio_cfg = LogMelConfig(**cfg.get("audio", {}))
     model = DenseAMT(DenseAMTConfig(**cfg.get("model", {}))).to(device)
     model.load_state_dict(ckpt["model"], strict=False)
@@ -424,6 +436,7 @@ def main() -> None:
                 frame_diff_context_threshold=frame_diff_context_threshold,
                 frame_diff_context_window_frames=frame_diff_context_window_frames,
                 frame_diff_context_min_pitches=frame_diff_context_min_pitches,
+                pitch_threshold_bias=pitch_threshold_bias,
             )
             before_center_notes = len(window_notes)
             if decode_center_only and reliable_margin_seconds > 0.0 and end - start > reliable_margin_seconds * 2.0:
@@ -441,6 +454,7 @@ def main() -> None:
                     duration=end - start,
                     decode_cfg=assistant_decode_cfg,
                     target_cfg=assistant_target_cfg,
+                    pitch_threshold_bias=assistant_pitch_threshold_bias,
                 )
                 assistant_before_center_notes = len(assistant_window_notes)
                 if (
@@ -624,6 +638,8 @@ def main() -> None:
             "score_notation": score_notation_debug,
             "hybrid_rescue": hybrid_cfg.to_json() if hybrid_cfg.enabled else {},
             "hybrid_stats": hybrid_totals,
+            "pitch_calibration": summarize_pitch_threshold_bias(pitch_threshold_bias),
+            "assistant_pitch_calibration": summarize_pitch_threshold_bias(assistant_pitch_threshold_bias),
             "decode": {
                 "onset_threshold": onset_threshold,
                 "frame_threshold": frame_threshold,
@@ -740,6 +756,7 @@ def _decode_notes_from_config(
     duration: float,
     decode_cfg: dict,
     target_cfg: dict,
+    pitch_threshold_bias: dict[int, float] | None = None,
 ) -> list:
     disable_chord_recovery = bool(decode_cfg.get("disable_chord_recovery", False))
     chord_onset_threshold = None if disable_chord_recovery else decode_cfg.get("chord_onset_threshold")
@@ -776,11 +793,12 @@ def _decode_notes_from_config(
         frame_diff_context_threshold=float(decode_cfg.get("frame_diff_context_threshold", 0.0)),
         frame_diff_context_window_frames=int(decode_cfg.get("frame_diff_context_window_frames", 0)),
         frame_diff_context_min_pitches=int(decode_cfg.get("frame_diff_context_min_pitches", 0)),
+        pitch_threshold_bias=pitch_threshold_bias,
     )
 
 
 def _hybrid_config_from_args(args: argparse.Namespace) -> HybridRescueConfig:
-    defaults = HybridRescueConfig()
+    defaults = resolve_hybrid_preset(args.hybrid_preset)
     return HybridRescueConfig(
         enabled=bool(args.hybrid_rescue and args.assistant_ckpt),
         mode=str(args.hybrid_mode or defaults.mode),
@@ -810,6 +828,24 @@ def _hybrid_config_from_args(args: argparse.Namespace) -> HybridRescueConfig:
             args.hybrid_max_total_notes_per_second,
             defaults.max_total_notes_per_second,
         ),
+        extend_duplicate_long_notes=bool(defaults.extend_duplicate_long_notes and not args.hybrid_disable_long_extension),
+        extension_window_seconds=_arg_or_default(
+            args.hybrid_extension_window_seconds,
+            defaults.extension_window_seconds,
+        ),
+        extension_min_gain_seconds=_arg_or_default(
+            args.hybrid_extension_min_gain_seconds,
+            defaults.extension_min_gain_seconds,
+        ),
+        extension_min_duration_seconds=_arg_or_default(
+            args.hybrid_extension_min_duration_seconds,
+            defaults.extension_min_duration_seconds,
+        ),
+        extension_max_gain_seconds=_arg_or_default(
+            args.hybrid_extension_max_gain_seconds,
+            defaults.extension_max_gain_seconds,
+        ),
+        extension_pitch_max=int(_arg_or_default(args.hybrid_extension_pitch_max, defaults.extension_pitch_max)),
     )
 
 

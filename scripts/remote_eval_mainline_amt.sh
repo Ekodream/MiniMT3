@@ -23,6 +23,21 @@ teacher_args=()
 if [[ -n "${TEACHER_MIDI_DIR:-}" ]]; then
   teacher_args=(--teacher_midi_dir "${TEACHER_MIDI_DIR}")
 fi
+assistant_args=()
+if [[ -n "${ASSISTANT_CKPT:-}" ]]; then
+  assistant_args=(--assistant_ckpt "${ASSISTANT_CKPT}" --assistant_decode_preset "${ASSISTANT_PRESET:-v19_recall}")
+fi
+hybrid_args=()
+if [[ "${HYBRID_RESCUE:-0}" == "1" ]]; then
+  hybrid_args=(--hybrid_rescue --hybrid_preset "${HYBRID_PRESET:-hybrid_score}")
+fi
+pitch_args=()
+if [[ -n "${PITCH_CALIBRATION_JSON:-}" ]]; then
+  pitch_args+=(--pitch_calibration_json "${PITCH_CALIBRATION_JSON}")
+fi
+if [[ -n "${ASSISTANT_PITCH_CALIBRATION_JSON:-}" ]]; then
+  pitch_args+=(--assistant_pitch_calibration_json "${ASSISTANT_PITCH_CALIBRATION_JSON}")
+fi
 score_quality_args=()
 if [[ "${SCORE_QUALITY_EVAL:-0}" == "1" ]]; then
   score_quality_args=(--score_quality_eval)
@@ -39,6 +54,9 @@ fi
   --decode_preset "${PRESET}" \
   "${cache_args[@]}" \
   "${teacher_args[@]}" \
+  "${assistant_args[@]}" \
+  "${hybrid_args[@]}" \
+  "${pitch_args[@]}" \
   --onset_thresholds "${ONSET_THRESHOLDS:-0.46,0.48,0.50,0.52}" \
   --frame_thresholds "${FRAME_THRESHOLDS:-0.24}" \
   --offset_thresholds "${OFFSET_THRESHOLDS:-0.18,0.20,0.24}" \

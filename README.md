@@ -6,10 +6,85 @@ MiniMT3-Piano is a compact piano automatic music transcription project. The firs
 audio -> log-mel -> dense piano AMT -> post-processing -> MIDI/MusicXML -> local UI
 ```
 
-The current practical line is the dense AMT family. v5.3 is the stable display baseline, v5.4 adds ScorePolish
-readable-score interpretation, and v8 is the active quality push toward stronger MT3/Onsets-and-Frames style behavior.
-Earlier seq2seq/MT3-style experiments are kept in the repository for ablations, but the recommended inference path is
-`scripts/infer_amt.py`.
+The current practical line is the dense AMT family. The converged mainline is the v13/v15/v19 set documented below:
+v15 is the default metric/performance-MIDI model, v13 is the clean score base, and v19 is an auxiliary high-F1/offset
+candidate for analysis or hybrid rescue. Earlier seq2seq/MT3-style experiments and v5-v12 dense-AMT runs are kept in
+the repository for ablations, but the recommended inference path is `scripts/infer_amt.py` or the wrapper
+`scripts/final_infer.sh`.
+
+## Final Mainline Snapshot
+
+The current converged dense-AMT line is no longer a pure "bigger model" search. The recommended system is split into
+an AMT/metric output and a score-display output:
+
+| Version | Role | Main result | Use it when |
+| --- | --- | --- | --- |
+| `v13_best` | clean score base | `note_f1=0.5344`, `offset_f1=0.2538`, `pred_ref=0.979` | a stable, readable MusicXML baseline is more important than recall |
+| `v15_best` | default AMT model | `note_f1=0.5799`, `offset_f1=0.2880`, `pred_ref=0.956` | reporting metrics, exporting performance MIDI, or making the default controlled score |
+| `v19_selected` | auxiliary high-F1/offset model | `note_f1=0.5942`, `offset_f1=0.3016`, `pred_ref=0.753` | analysis, offset/long-note rescue, and hybrid assistance; not direct score display |
+| `v13+v19 hybrid` | display candidate | Test_new `chord_verticality=0.462`, visible rests `2`, voice collisions `13` | the current best showcase candidate after manual listening/visual check |
+
+Final reports are written by the convergence script:
+
+```text
+outputs/eval_final_mainline/final_metrics.json
+outputs/eval_final_mainline/final_metrics.csv
+outputs/demo_compare/final_demo_report.json
+```
+
+Recommended single-file inference wrapper:
+
+```bash
+# Performance MIDI / metric-oriented output.
+AUDIO=../demo/Test_new.wav MODE=analysis_midi bash scripts/final_infer.sh
+
+# Default controlled score from v15.
+AUDIO=../demo/Test_new.wav MODE=score_demo bash scripts/final_infer.sh
+
+# Current showcase candidate: clean v13 base rescued by selected v19 chord/long-note candidates.
+AUDIO=../demo/Test_new.wav MODE=hybrid_score bash scripts/final_infer.sh
+
+# Metric-oriented v13+v19 hybrid output. Use for diagnosis, not as the default showcase score.
+AUDIO=../demo/Test_new.wav MODE=hybrid_f1 bash scripts/final_infer.sh
+```
+
+The full final comparison can be regenerated on the remote machine with:
+
+```bash
+LAUNCH_FINAL=1 bash scripts/remote_finalize_mainline.sh
+```
+
+The current small convergence pass for v13+v19 hybrid is:
+
+```bash
+LAUNCH_HYBRID=1 bash scripts/remote_hybrid_converge.sh
+```
+
+It writes:
+
+```text
+outputs/eval_hybrid_converge/hybrid_metrics.json
+outputs/eval_hybrid_converge/hybrid_metrics.csv
+outputs/demo_compare/hybrid_demo_report.json
+```
+
+For score demos, keep explicit notation hints when known:
+
+```bash
+SCORE_TIME=4/4 SCORE_TEMPO=100 SCORE_KEY="C# minor" \
+  AUDIO=../demo/Test_new.wav MODE=hybrid_score bash scripts/final_infer.sh
+```
+
+Next optimization should stay small and targeted: tune the `display_chord_long` hybrid preset, add per-pitch calibration
+for `v19_selected` to reduce under-generation, and continue improving chord lock, voice assignment, and long-note ties
+in the score pipeline. Do not start another super-large backbone run unless these calibration and score-layer options
+are exhausted.
+
+The hybrid-specific presets are:
+
+- `hybrid_score`: clean v13 score base plus conservative v19 chord/low-long rescue and duplicate long-note extension.
+- `hybrid_f1`: looser v13+v19 rescue for validation F1/recall diagnosis; it may be denser than the showcase score.
+- `display_chord_long`: compatibility alias for `hybrid_score`.
 
 ## Setup
 

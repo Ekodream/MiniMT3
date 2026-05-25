@@ -40,6 +40,8 @@ def decode_dense_notes(
     frame_diff_context_threshold: float = 0.0,
     frame_diff_context_window_frames: int = 0,
     frame_diff_context_min_pitches: int = 0,
+    pitch_threshold_bias: dict[int, float] | None = None,
+    chord_pitch_threshold_bias: dict[int, float] | None = None,
 ) -> list[NoteEvent]:
     onset = torch.sigmoid(outputs["onset_logits"])[0].detach().cpu()
     frame = torch.sigmoid(outputs["frame_logits"])[0].detach().cpu()
@@ -82,7 +84,12 @@ def decode_dense_notes(
     nms_frames = max(1, int(round(min_onset_gap_seconds / max(1e-6, frame_seconds))))
 
     for pitch_idx in range(pitches):
-        peaks = _onset_peaks(onset_for_peaks[:, pitch_idx], onset_threshold, prominence=onset_peak_prominence)
+        pitch_onset_threshold = _threshold_with_pitch_bias(onset_threshold, pitch_threshold_bias, pitch_idx)
+        peaks = _onset_peaks(
+            onset_for_peaks[:, pitch_idx],
+            pitch_onset_threshold,
+            prominence=onset_peak_prominence,
+        )
         for start_idx in peaks:
             if min_frame_at_onset > 0.0 and float(frame[start_idx, pitch_idx]) < min_frame_at_onset:
                 continue
@@ -109,7 +116,12 @@ def decode_dense_notes(
                     continue
                 local_value, local_offset = torch.max(local, dim=0)
                 idx = lo + int(local_offset)
-                if float(local_value) >= adaptive_threshold and float(frame[idx, pitch_idx]) >= chord_frame_threshold:
+                pitch_chord_threshold = _threshold_with_pitch_bias(
+                    adaptive_threshold,
+                    chord_pitch_threshold_bias or pitch_threshold_bias,
+                    pitch_idx,
+                )
+                if float(local_value) >= pitch_chord_threshold and float(frame[idx, pitch_idx]) >= chord_frame_threshold:
                     score = float(local_value) * 0.98
                     candidates.append((score, idx, pitch_idx))
                     existing.add((idx, pitch_idx))
@@ -188,6 +200,18 @@ def decode_dense_notes(
         notes = [note for _, note in note_items]
     notes.sort(key=lambda n: (n.start, -n.velocity, n.pitch))
     return notes
+
+
+def _threshold_with_pitch_bias(
+    threshold: float,
+    pitch_threshold_bias: dict[int, float] | None,
+    pitch_idx: int,
+) -> float:
+    if not pitch_threshold_bias:
+        return float(threshold)
+    midi_pitch = PITCH_MIN + int(pitch_idx)
+    bias = pitch_threshold_bias.get(midi_pitch, pitch_threshold_bias.get(int(pitch_idx), 0.0))
+    return max(0.01, min(0.99, float(threshold) + float(bias)))
 
 
 def _onset_peaks(values: torch.Tensor, threshold: float, prominence: float = 0.0) -> list[int]:

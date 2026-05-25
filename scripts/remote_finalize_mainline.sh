@@ -77,13 +77,30 @@ run_eval() {
     OUT_DIR="${EVAL_DIR}" \
     SCORE_QUALITY_EVAL="${SCORE_QUALITY_EVAL:-1}" \
     SCORE_QUALITY_ITEMS="${SCORE_QUALITY_ITEMS:-24}" \
-    ONSET_THRESHOLDS="${ONSET_THRESHOLDS:-0.46,0.48,0.50,0.52,0.54}" \
+    ONSET_THRESHOLDS="${ONSET_THRESHOLDS:-0.50,0.52,0.54}" \
     FRAME_THRESHOLDS="${FRAME_THRESHOLDS:-0.24}" \
-    OFFSET_THRESHOLDS="${OFFSET_THRESHOLDS:-0.18,0.20,0.24}" \
-    FRAME_DIFF_MODES="${FRAME_DIFF_MODES:-false,true}" \
-    FRAME_DIFF_SCALES="${FRAME_DIFF_SCALES:-0.45,0.60}" \
-    DURATION_EXTENSION_WEIGHTS="${DURATION_EXTENSION_WEIGHTS:-0.0,0.25,0.50}" \
+    OFFSET_THRESHOLDS="${OFFSET_THRESHOLDS:-0.20,0.24}" \
+    FRAME_DIFF_MODES="${FRAME_DIFF_MODES:-false}" \
+    FRAME_DIFF_SCALES="${FRAME_DIFF_SCALES:-0.45}" \
+    DURATION_EXTENSION_WEIGHTS="${DURATION_EXTENSION_WEIGHTS:-0.25}" \
     bash scripts/remote_eval_mainline_amt.sh
+}
+
+copy_existing_baselines() {
+  local src_v13=${EXISTING_V13_EVAL:-outputs/eval_compare_v13_v15/v13_best_val_calib512.json}
+  local src_v15=${EXISTING_V15_EVAL:-outputs/eval_compare_v13_v15/v15_xlarge_best_val_calib512.json}
+  if [[ -s "${src_v13}" ]]; then
+    cp -f "${src_v13}" "${EVAL_DIR}/v13_best_practice_score_val_calib512.json"
+    echo "copied existing baseline ${src_v13}"
+  else
+    echo "missing existing v13 eval: ${src_v13}" >&2
+  fi
+  if [[ -s "${src_v15}" ]]; then
+    cp -f "${src_v15}" "${EVAL_DIR}/v15_best_v15_f1_val_calib512.json"
+    echo "copied existing baseline ${src_v15}"
+  else
+    echo "missing existing v15 eval: ${src_v15}" >&2
+  fi
 }
 
 infer_demo() {
@@ -126,17 +143,23 @@ run_demos_for_audio() {
   infer_demo "${audio}" v19_recall "${V19_SELECTED_CKPT}" v19_recall performance_midi
   infer_demo "${audio}" v19_score "${V19_SELECTED_CKPT}" v19_precision score_demo_4_4
   infer_demo "${audio}" v13_v15_hybrid_score "${V13_CKPT}" practice_score score_demo_4_4 \
-    --assistant_ckpt "${V15_CKPT}" --assistant_decode_preset v15_rescue --hybrid_rescue
+    --assistant_ckpt "${V15_CKPT}" --assistant_decode_preset v15_rescue --hybrid_rescue \
+    --hybrid_preset display_chord_long
   infer_demo "${audio}" v13_v19_hybrid_score "${V13_CKPT}" practice_score score_demo_4_4 \
-    --assistant_ckpt "${V19_SELECTED_CKPT}" --assistant_decode_preset v19_recall --hybrid_rescue
+    --assistant_ckpt "${V19_SELECTED_CKPT}" --assistant_decode_preset v19_recall --hybrid_rescue \
+    --hybrid_preset display_chord_long
 }
 
 run_inside() {
   wait_for_v19
   preserve_v19_selected
   if [[ "${RUN_EVAL:-1}" == "1" ]]; then
-    run_eval v13_best "${V13_CKPT}" practice_score data/cache/amt_v13_large_finetune_calib512_val_8s_10ms_229mel_center6
-    run_eval v15_best "${V15_CKPT}" v15_f1 data/cache/amt_v15_xlarge_duration_calib512_val_8s_10ms_229mel_center6
+    if [[ "${RUN_BASELINE_EVAL:-0}" == "1" ]]; then
+      run_eval v13_best "${V13_CKPT}" practice_score data/cache/amt_v13_large_finetune_calib512_val_8s_10ms_229mel_center6
+      run_eval v15_best "${V15_CKPT}" v15_f1 data/cache/amt_v15_xlarge_duration_calib512_val_8s_10ms_229mel_center6
+    else
+      copy_existing_baselines
+    fi
     run_eval v19_selected "${V19_SELECTED_CKPT}" v19_precision data/cache/amt_v19_precision_teacher_gate_calib512_val_8s_10ms_229mel_center6
     run_eval v19_step1800 "${V19_STEP1800_CKPT}" v19_precision data/cache/amt_v19_precision_teacher_gate_calib512_val_8s_10ms_229mel_center6
   fi
@@ -173,7 +196,7 @@ fi
 
 if [[ "${LAUNCH_FINAL:-0}" == "1" ]]; then
   tmux new-session -d -s "${SESSION}" \
-    "cd ${PROJECT_DIR} && RUN_INSIDE=1 PROJECT_DIR=${PROJECT_DIR} PYTHON_BIN=${PYTHON_BIN} GPU_ID=${GPU_ID} STAMP=${STAMP} bash scripts/remote_finalize_mainline.sh > log/final_converge_${STAMP}.log 2>&1"
+    "cd ${PROJECT_DIR} && RUN_INSIDE=1 PROJECT_DIR=${PROJECT_DIR} PYTHON_BIN=${PYTHON_BIN} GPU_ID=${GPU_ID} STAMP=${STAMP} RUN_EVAL=${RUN_EVAL:-1} RUN_DEMO=${RUN_DEMO:-1} RUN_BASELINE_EVAL=${RUN_BASELINE_EVAL:-0} bash scripts/remote_finalize_mainline.sh > log/final_converge_${STAMP}.log 2>&1"
   echo "started ${SESSION}"
   echo "log: ${PROJECT_DIR}/log/final_converge_${STAMP}.log"
 fi
