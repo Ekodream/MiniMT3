@@ -36,6 +36,10 @@ def decode_dense_notes(
     infer_onsets_from_frame_diff: bool = False,
     frame_diff_n: int = 2,
     frame_diff_scale: float = 1.0,
+    frame_diff_min_onset: float = 0.0,
+    frame_diff_context_threshold: float = 0.0,
+    frame_diff_context_window_frames: int = 0,
+    frame_diff_context_min_pitches: int = 0,
 ) -> list[NoteEvent]:
     onset = torch.sigmoid(outputs["onset_logits"])[0].detach().cpu()
     frame = torch.sigmoid(outputs["frame_logits"])[0].detach().cpu()
@@ -55,10 +59,21 @@ def decode_dense_notes(
         weight = max(0.0, min(1.0, float(onset_frame_fusion_weight)))
         onset_for_peaks = torch.maximum(onset, (1.0 - weight) * onset + weight * frame)
     if infer_onsets_from_frame_diff:
-        onset_for_peaks = torch.maximum(
+        inferred = _inferred_onsets_from_frame_diff(
             onset_for_peaks,
-            _inferred_onsets_from_frame_diff(onset_for_peaks, frame, n_diff=int(frame_diff_n), scale=float(frame_diff_scale)),
+            frame,
+            n_diff=int(frame_diff_n),
+            scale=float(frame_diff_scale),
         )
+        inferred = _mask_inferred_onsets(
+            inferred,
+            onset,
+            min_onset=float(frame_diff_min_onset),
+            context_threshold=float(frame_diff_context_threshold),
+            context_window_frames=int(frame_diff_context_window_frames),
+            context_min_pitches=int(frame_diff_context_min_pitches),
+        )
+        onset_for_peaks = torch.maximum(onset_for_peaks, inferred)
     frames, pitches = onset.shape
     frame_seconds = float(duration) / max(1, frames)
     min_frames = max(1, int(round(min_note_seconds / max(1e-6, frame_seconds))))
@@ -212,6 +227,31 @@ def _inferred_onsets_from_frame_diff(
     if max_inferred <= 1e-8:
         return torch.zeros_like(onsets)
     return inferred * (target_peak / max_inferred) * max(0.0, float(scale))
+
+
+def _mask_inferred_onsets(
+    inferred: torch.Tensor,
+    onsets: torch.Tensor,
+    min_onset: float,
+    context_threshold: float,
+    context_window_frames: int,
+    context_min_pitches: int,
+) -> torch.Tensor:
+    direct = onsets >= float(min_onset) if min_onset > 0.0 else torch.ones_like(onsets, dtype=torch.bool)
+    if context_threshold <= 0.0 or context_min_pitches <= 0:
+        return torch.where(direct, inferred, torch.zeros_like(inferred))
+    strong = onsets >= float(context_threshold)
+    context_counts = strong.float().sum(dim=1, keepdim=True)
+    window = max(0, int(context_window_frames))
+    if window > 0:
+        expanded = []
+        for idx in range(strong.shape[0]):
+            lo = max(0, idx - window)
+            hi = min(strong.shape[0], idx + window + 1)
+            expanded.append(context_counts[lo:hi].max(dim=0).values)
+        context_counts = torch.stack(expanded, dim=0)
+    chord_context = context_counts.expand_as(onsets) >= int(context_min_pitches)
+    return torch.where(direct | chord_context, inferred, torch.zeros_like(inferred))
 
 
 def _find_note_end(

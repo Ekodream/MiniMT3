@@ -1,0 +1,227 @@
+seed: 187
+nproc_per_node: 8
+train_manifest: data/cache/amt_train_8s_mix88hard12_v19.json
+val_manifest: data/cache/amt_val_8s_s8_calib512_v13.json
+train_split: train
+val_split: validation
+output_dir: outputs/ckpt_amt_v19_xlarge_precision_teacher_gate
+train_cache_dir: data/cache/amt_v19_precision_teacher_gate_train_8s_10ms_229mel_center6
+val_cache_dir: data/cache/amt_v19_precision_teacher_gate_calib512_val_8s_10ms_229mel_center6
+init_from: outputs/ckpt_amt_v15_xlarge_duration/best.pt
+init_expand: false
+teacher_midi_dir: outputs/teacher_bytedance/train_v18_hard4096
+max_items:
+val_max_items: 512
+batch_size: 4
+eval_batch_size: 4
+num_workers: 4
+eval_workers: 2
+epochs: 60
+max_steps: 1800
+lr: 0.000006
+min_lr: 0.0000015
+warmup_steps: 150
+weight_decay: 0.00012
+betas: [0.9, 0.999]
+grad_clip: 3.0
+precision: bf16
+allow_tf32: true
+dist_timeout_minutes: 120
+prefetch_factor: 3
+log_interval: 30
+eval_interval: 300
+save_interval: 600
+debug_items: 48
+save_predebug_checkpoint: true
+early_stop_min_steps: 900
+early_stop_patience_evals: 4
+early_stop_min_delta: 0.0001
+bad_clip_f1_threshold: 0.08
+decode_preset: v19_precision
+
+hard_category_weights:
+  base: 1.0
+  dense_chords: 1.06
+  low_long_pedal: 1.16
+  mid_long_notes: 1.14
+  weak_notes: 1.10
+  very_short_notes: 0.82
+  fast_arpeggio: 1.04
+
+selection:
+  note_f1_weight: 12.0
+  note_recall_weight: 0.45
+  note_precision_weight: 0.72
+  offset_f1_weight: 1.15
+  ratio_log_penalty: 1.45
+  over_generation_ratio: 1.12
+  under_generation_ratio: 0.84
+  f1_min_pred_ref_ratio: 0.78
+  f1_max_pred_ref_ratio: 1.18
+  over_generation_penalty: 1.25
+  under_generation_penalty: 0.60
+  bad_clip_penalty: 1.6
+
+selection_sweep:
+  enabled: true
+  onset_thresholds: [0.48, 0.50, 0.52, 0.54]
+  frame_thresholds: [0.24, 0.26]
+  offset_thresholds: [0.20, 0.24]
+  frame_diff_modes: [false, true]
+  frame_diff_scales: [0.40, 0.45, 0.50]
+  duration_extension_weights: [0.0, 0.25, 0.35]
+
+debug_selection_sweep:
+  enabled: true
+  onset_thresholds: [0.50, 0.52, 0.54]
+  frame_thresholds: [0.24]
+  offset_thresholds: [0.20, 0.24]
+  frame_diff_modes: [false, true]
+  frame_diff_scales: [0.45]
+  duration_extension_weights: [0.25]
+
+augment:
+  enabled: true
+  gain_range: [0.94, 1.06]
+  noise_std: 0.0025
+  freq_masks: 1
+  freq_mask_max_bins: 8
+  time_masks: 1
+  time_mask_max_frames: 28
+  time_mask_max_ratio: 0.035
+  mask_value: 0.0
+
+inference:
+  window_seconds: 8.0
+  overlap_seconds: 2.0
+
+audio:
+  sample_rate: 16000
+  n_mels: 229
+  n_fft: 2048
+  hop_length: 160
+  f_min: 30.0
+  f_max: 8000.0
+
+targets:
+  frame_strides: [1]
+  onset_width_frames: 0
+  offset_width_frames: 0
+  onset_soft_radius_frames: 2
+  offset_soft_radius_frames: 2
+  min_note_seconds: 0.02
+  include_pedal: true
+  include_duration: true
+  include_time_shifts: true
+  max_duration_seconds: 16.0
+  time_shift_clip_frames: 1.0
+  supervision_margin_seconds: 1.0
+
+model:
+  architecture: crnn_ensemble
+  n_mels: 229
+  predict_pedal: true
+  predict_duration: true
+  predict_time_shifts: true
+  acoustic_hidden: 1280
+  acoustic_rnn_hidden: 448
+  acoustic_channels: [80, 112, 160, 224]
+  acoustic_context_layers: 1
+  acoustic_context_dropout: 0.12
+  acoustic_attention_layers: 2
+  acoustic_attention_heads: 8
+  acoustic_attention_dim_feedforward: 2688
+
+loss:
+  onset_weight: 1.38
+  frame_weight: 0.56
+  offset_weight: 1.22
+  velocity_weight: 0.08
+  pedal_weight: 0.28
+  duration_weight: 0.20
+  duration_long_weight: 2.0
+  duration_long_target_min: 0.35
+  teacher_onset_weight: 0.025
+  teacher_frame_weight: 0.0
+  teacher_offset_weight: 0.010
+  teacher_positive_only: true
+  teacher_gt_gate: true
+  teacher_gt_gate_frames: 1
+  onset_shift_weight: 0.14
+  offset_shift_weight: 0.14
+  onset_mass_weight: 0.026
+  offset_mass_weight: 0.014
+  frame_mass_weight: 0.0
+  onset_pos_weight: 8.2
+  frame_pos_weight: 1.8
+  offset_pos_weight: 8.4
+  pedal_pos_weight: 2.8
+  onset_neg_weight: 1.18
+  frame_neg_weight: 1.06
+  offset_neg_weight: 1.10
+  pedal_neg_weight: 1.0
+  onset_focal_gamma_pos: 0.0
+  onset_focal_gamma_neg: 0.24
+  frame_focal_gamma_pos: 0.0
+  frame_focal_gamma_neg: 0.16
+  offset_focal_gamma_pos: 0.0
+  offset_focal_gamma_neg: 0.18
+
+decode:
+  onset_threshold: 0.52
+  frame_threshold: 0.24
+  offset_threshold: 0.20
+  min_note_seconds: 0.045
+  max_notes_per_second: 26.0
+  max_polyphony: 12
+  min_onset_gap_seconds: 0.030
+  min_frame_at_onset: 0.0
+  onset_frame_fusion_weight: 0.0
+  disable_chord_recovery: false
+  chord_onset_threshold: 0.54
+  chord_frame_threshold: 0.26
+  chord_window_frames: 2
+  chord_score_ratio: 0.90
+  onset_peak_prominence: 0.012
+  max_notes_per_start_window: 7
+  start_window_seconds: 0.055
+  use_duration_head: true
+  max_duration_seconds: 16.0
+  duration_extension_weight: 0.25
+  consume_note_energy: true
+  energy_neighbor_pitches: 0
+  energy_overlap_ratio: 0.56
+  infer_onsets_from_frame_diff: true
+  frame_diff_n: 2
+  frame_diff_scale: 0.45
+  frame_diff_min_onset: 0.24
+  frame_diff_context_threshold: 0.50
+  frame_diff_context_window_frames: 1
+  frame_diff_context_min_pitches: 2
+  eval_center_only: true
+  decode_center_only: true
+  reliable_margin_seconds: 1.0
+  merge_tolerance_seconds: 0.05
+  pedal_threshold: 0.50
+  performance_min_note_seconds: 0.055
+  performance_min_velocity: 5
+  sustain_max_extension: 1.8
+  score_quantize_seconds: 0.125
+  score_min_note_seconds: 0.125
+  score_min_velocity: 8
+  score_max_chord_notes: 10
+  time_signature: "4/4"
+  score_beat_divisions: "2,4"
+  score_allow_tuplets: false
+  score_chord_tolerance_seconds: 0.080
+  score_max_note_beats: 6.0
+  score_min_note_beats: 0.25
+  score_max_notes_per_beat: 5
+  score_merge_extension_seconds: 0.25
+  score_max_overlap_beats: 0.0
+  score_max_short_rest_beats: 0.5
+  score_leading_rest_threshold_beats: 0.5
+  score_chord_snap_seconds: 0.100
+  score_chord_snap_max_spread_beats: 0.22
+  score_lock_chord_durations: true
+  score_chord_lock_max_duration_spread_beats: 0.75

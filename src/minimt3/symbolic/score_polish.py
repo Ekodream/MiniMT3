@@ -77,6 +77,8 @@ class ScorePolishConfig:
     start_offset_seconds: float | None = None
     chord_snap_seconds: float = 0.075
     chord_snap_max_spread_beats: float = 0.25
+    lock_chord_durations: bool = True
+    chord_lock_max_duration_spread_beats: float = 0.75
 
 
 @dataclass
@@ -131,6 +133,7 @@ def polish_score_notes(
         cfg,
         beat_divisions=beat_divisions,
     )
+    quantized, chord_lock_rate = _lock_chord_durations(quantized, seconds_per_quarter, cfg)
     right, left, hand_crossings = assign_hands_dp(quantized, cfg)
     right, right_fill_rate = _fill_short_rests(right, seconds_per_quarter, cfg)
     left, left_fill_rate = _fill_short_rests(left, seconds_per_quarter, cfg)
@@ -146,6 +149,7 @@ def polish_score_notes(
         "tiny_pruned_rate": tiny_pruned_rate,
         "score_start_shift_seconds": start_shift,
         "chord_snap_rate": chord_snap_rate,
+        "chord_lock_rate": chord_lock_rate,
         "short_rest_fill_rate": (right_fill_rate + left_fill_rate) / 2.0,
         "overlap_trim_rate": (right_overlap_trim_rate + left_overlap_trim_rate) / 2.0,
         "chord_collapse_rate": collapse_rate,
@@ -547,6 +551,36 @@ def _quantize_to_beat_grid(
     out = list(deduped.values())
     out.sort(key=lambda n: (n.start, n.pitch, n.end))
     return out, total_error / max(1, len(notes)), collapse_risk / max(1, len(notes))
+
+
+def _lock_chord_durations(
+    notes: list[NoteEvent],
+    seconds_per_quarter: float,
+    cfg: ScorePolishConfig,
+) -> tuple[list[NoteEvent], float]:
+    if not notes or not cfg.lock_chord_durations:
+        return notes, 0.0
+    max_spread = max(0.0, float(cfg.chord_lock_max_duration_spread_beats)) * seconds_per_quarter
+    if max_spread <= 1e-6:
+        return notes, 0.0
+    changed = 0
+    locked: list[NoteEvent] = []
+    for group in _group_by_start(notes, tolerance=1e-5):
+        if len(group) < 2:
+            locked.extend(group)
+            continue
+        durations = [max(0.0, note.end - note.start) for note in group]
+        spread = max(durations) - min(durations)
+        if spread <= max_spread:
+            target_end = max(note.end for note in group)
+            for note in group:
+                if abs(note.end - target_end) > 1e-6:
+                    changed += 1
+                locked.append(NoteEvent(note.pitch, note.start, target_end, note.velocity))
+            continue
+        locked.extend(group)
+    locked.sort(key=lambda n: (n.start, n.pitch, n.end))
+    return locked, changed / max(1, len(notes))
 
 
 def _limit_note_density(

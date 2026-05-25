@@ -20,8 +20,10 @@ class DenseTargetConfig:
     min_note_seconds: float = 0.02
     include_pedal: bool = False
     include_duration: bool = False
+    include_duration_bucket: bool = False
     include_time_shifts: bool = False
     max_duration_seconds: float = 8.0
+    duration_bucket_bounds: tuple[float, ...] | list[float] = (0.125, 0.5, 2.0)
     frame_strides: tuple[int, int] | list[int] = (2, 2)
     time_shift_clip_frames: float = 1.0
     supervision_margin_seconds: float = 0.0
@@ -51,7 +53,10 @@ def build_dense_targets(
     velocity = torch.zeros(frames, NUM_PITCHES)
     onset_mask = torch.zeros(frames, NUM_PITCHES)
     note_duration = torch.zeros(frames, NUM_PITCHES) if cfg.include_duration else None
+    note_duration_frame = torch.zeros(frames, NUM_PITCHES) if cfg.include_duration else None
     duration_mask = torch.zeros(frames, NUM_PITCHES) if cfg.include_duration else None
+    duration_bucket = torch.zeros(frames, NUM_PITCHES, dtype=torch.long) if cfg.include_duration_bucket else None
+    duration_bucket_mask = torch.zeros(frames, NUM_PITCHES) if cfg.include_duration_bucket else None
     onset_shift = torch.zeros(frames, NUM_PITCHES) if cfg.include_time_shifts else None
     onset_shift_mask = torch.zeros(frames, NUM_PITCHES) if cfg.include_time_shifts else None
     offset_shift = torch.zeros(frames, NUM_PITCHES) if cfg.include_time_shifts else None
@@ -69,7 +74,10 @@ def build_dense_targets(
             cfg,
             write_onset=True,
             note_duration=note_duration,
+            note_duration_frame=note_duration_frame,
             duration_mask=duration_mask,
+            duration_bucket=duration_bucket,
+            duration_bucket_mask=duration_bucket_mask,
             onset_shift=onset_shift,
             onset_shift_mask=onset_shift_mask,
             offset_shift=offset_shift,
@@ -87,7 +95,10 @@ def build_dense_targets(
             cfg,
             write_onset=False,
             note_duration=note_duration,
+            note_duration_frame=note_duration_frame,
             duration_mask=duration_mask,
+            duration_bucket=duration_bucket,
+            duration_bucket_mask=duration_bucket_mask,
             onset_shift=onset_shift,
             onset_shift_mask=onset_shift_mask,
             offset_shift=offset_shift,
@@ -102,7 +113,12 @@ def build_dense_targets(
     }
     if note_duration is not None and duration_mask is not None:
         targets["duration"] = note_duration
+        if note_duration_frame is not None:
+            targets["duration_frame"] = note_duration_frame
         targets["duration_mask"] = duration_mask
+    if duration_bucket is not None and duration_bucket_mask is not None:
+        targets["duration_bucket"] = duration_bucket
+        targets["duration_bucket_mask"] = duration_bucket_mask
     if (
         onset_shift is not None
         and onset_shift_mask is not None
@@ -134,7 +150,10 @@ def _write_note(
     cfg: DenseTargetConfig,
     write_onset: bool,
     note_duration: torch.Tensor | None = None,
+    note_duration_frame: torch.Tensor | None = None,
     duration_mask: torch.Tensor | None = None,
+    duration_bucket: torch.Tensor | None = None,
+    duration_bucket_mask: torch.Tensor | None = None,
     onset_shift: torch.Tensor | None = None,
     onset_shift_mask: torch.Tensor | None = None,
     offset_shift: torch.Tensor | None = None,
@@ -170,9 +189,16 @@ def _write_note(
                 onset_shift_mask[idx, pitch_idx] = 1.0
         if note_duration is not None and duration_mask is not None:
             normalized = _duration_to_unit(note.end - note.start, cfg.max_duration_seconds)
+            frame_fraction = max(0.0, min(1.0, (end_idx - start_idx) / max(1, frames - 1)))
+            bucket_idx = _duration_bucket(note.end - note.start, cfg.duration_bucket_bounds)
             for idx in onset_indices:
                 note_duration[idx, pitch_idx] = normalized
+                if note_duration_frame is not None:
+                    note_duration_frame[idx, pitch_idx] = frame_fraction
                 duration_mask[idx, pitch_idx] = 1.0
+                if duration_bucket is not None and duration_bucket_mask is not None:
+                    duration_bucket[idx, pitch_idx] = bucket_idx
+                    duration_bucket_mask[idx, pitch_idx] = 1.0
     if note.end < duration - 1e-4:
         offset_center = _time_to_frame_float(note.end, duration, frames)
         offset_idx = min(frames - 1, max(0, int(offset_center)))
@@ -237,3 +263,11 @@ def _clip_shift(value: float, clip: float) -> float:
 def _duration_to_unit(seconds: float, max_duration_seconds: float) -> float:
     max_duration_seconds = max(0.1, float(max_duration_seconds))
     return max(0.0, min(1.0, math.log1p(max(0.0, seconds)) / math.log1p(max_duration_seconds)))
+
+
+def _duration_bucket(seconds: float, bounds: tuple[float, ...] | list[float]) -> int:
+    value = max(0.0, float(seconds))
+    for idx, bound in enumerate(bounds):
+        if value < float(bound):
+            return idx
+    return len(bounds)

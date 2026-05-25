@@ -77,17 +77,29 @@ def main() -> None:
     parser.add_argument("--disable_duration_head", action="store_true")
     parser.add_argument("--max_duration_seconds", type=float)
     parser.add_argument("--duration_extension_weight", type=float)
+    parser.add_argument("--duration_extension_weights")
     parser.add_argument("--consume_note_energy", action="store_true")
     parser.add_argument("--energy_neighbor_pitches", type=int)
     parser.add_argument("--energy_overlap_ratio", type=float)
     parser.add_argument("--infer_onsets_from_frame_diff", action="store_true")
+    parser.add_argument("--frame_diff_modes")
     parser.add_argument("--frame_diff_n", type=int)
     parser.add_argument("--frame_diff_scale", type=float)
+    parser.add_argument("--frame_diff_scales")
+    parser.add_argument("--frame_diff_min_onset", type=float)
+    parser.add_argument("--frame_diff_context_threshold", type=float)
+    parser.add_argument("--frame_diff_context_window_frames", type=int)
+    parser.add_argument("--frame_diff_context_min_pitches", type=int)
     parser.add_argument("--eval_center_only", action="store_true")
+    parser.add_argument("--balanced_min_pred_ref", type=float, default=0.90)
+    parser.add_argument("--balanced_max_pred_ref", type=float, default=1.15)
+    parser.add_argument("--f1_min_pred_ref", type=float, default=0.78)
+    parser.add_argument("--f1_max_pred_ref", type=float, default=1.20)
     parser.add_argument("--analysis_json_out")
     parser.add_argument("--json_out")
     parser.add_argument("--error_midi_out")
     parser.add_argument("--score_quality_eval", action="store_true")
+    parser.add_argument("--score_quality_items", type=int, default=0)
     parser.add_argument("--teacher_midi_dir")
     parser.add_argument("--duration_buckets", default="0,0.125,0.5,2.0,inf")
     parser.add_argument("--chord_tolerance_seconds", type=float, default=0.05)
@@ -125,12 +137,9 @@ def main() -> None:
         cache_dir=args.cache_dir,
         target_config=target_config,
     )
-    combos = [
-        (onset_t, frame_t, offset_t)
-        for onset_t in _threshold_values(args.onset_thresholds, decode_cfg, "onset_threshold", [0.45, 0.55, 0.65, 0.75])
-        for frame_t in _threshold_values(args.frame_thresholds, decode_cfg, "frame_threshold", [0.30, 0.40, 0.50])
-        for offset_t in _threshold_values(args.offset_thresholds, decode_cfg, "offset_threshold", [0.30, 0.40, 0.50])
-    ]
+    onset_values = _threshold_values(args.onset_thresholds, decode_cfg, "onset_threshold", [0.45, 0.55, 0.65, 0.75])
+    frame_values = _threshold_values(args.frame_thresholds, decode_cfg, "frame_threshold", [0.30, 0.40, 0.50])
+    offset_values = _threshold_values(args.offset_thresholds, decode_cfg, "offset_threshold", [0.30, 0.40, 0.50])
     duration_buckets = parse_duration_buckets(args.duration_buckets)
     max_polyphony = int(args.max_polyphony or decode_cfg.get("max_polyphony", 12))
     max_notes_per_second = float(args.max_notes_per_second or decode_cfg.get("max_notes_per_second", 45.0))
@@ -208,7 +217,35 @@ def main() -> None:
     frame_diff_scale = float(
         args.frame_diff_scale if args.frame_diff_scale is not None else decode_cfg.get("frame_diff_scale", 1.0)
     )
+    frame_diff_min_onset = float(
+        args.frame_diff_min_onset
+        if args.frame_diff_min_onset is not None
+        else decode_cfg.get("frame_diff_min_onset", 0.0)
+    )
+    frame_diff_context_threshold = float(
+        args.frame_diff_context_threshold
+        if args.frame_diff_context_threshold is not None
+        else decode_cfg.get("frame_diff_context_threshold", 0.0)
+    )
+    frame_diff_context_window_frames = int(
+        args.frame_diff_context_window_frames
+        if args.frame_diff_context_window_frames is not None
+        else decode_cfg.get("frame_diff_context_window_frames", 0)
+    )
+    frame_diff_context_min_pitches = int(
+        args.frame_diff_context_min_pitches
+        if args.frame_diff_context_min_pitches is not None
+        else decode_cfg.get("frame_diff_context_min_pitches", 0)
+    )
     eval_center_only = bool(args.eval_center_only or decode_cfg.get("eval_center_only", False))
+    combos = _decode_combos(
+        onset_values,
+        frame_values,
+        offset_values,
+        _bool_values(args.frame_diff_modes, decode_cfg, "frame_diff_mode", infer_onsets_from_frame_diff),
+        _sweep_values(args.frame_diff_scales, decode_cfg, "frame_diff_scale", frame_diff_scale),
+        _sweep_values(args.duration_extension_weights, decode_cfg, "duration_extension_weight", duration_extension_weight),
+    )
 
     totals = {combo: new_metric_total() for combo in combos}
     combo_item_records: dict[tuple[float, float, float], list[dict[str, Any]]] = {combo: [] for combo in combos}
@@ -255,14 +292,18 @@ def main() -> None:
                     start_window_seconds=start_window_seconds,
                     use_duration_head=not args.disable_duration_head,
                     max_duration_seconds=max_duration_seconds,
-                    duration_extension_weight=duration_extension_weight,
+                    duration_extension_weight=combo[5],
                     time_shift_clip_frames=float(target_config.time_shift_clip_frames),
                     consume_note_energy=consume_note_energy,
                     energy_neighbor_pitches=energy_neighbor_pitches,
                     energy_overlap_ratio=energy_overlap_ratio,
-                    infer_onsets_from_frame_diff=infer_onsets_from_frame_diff,
+                    infer_onsets_from_frame_diff=combo[3],
                     frame_diff_n=frame_diff_n,
-                    frame_diff_scale=frame_diff_scale,
+                    frame_diff_scale=combo[4],
+                    frame_diff_min_onset=frame_diff_min_onset,
+                    frame_diff_context_threshold=frame_diff_context_threshold,
+                    frame_diff_context_window_frames=frame_diff_context_window_frames,
+                    frame_diff_context_min_pitches=frame_diff_context_min_pitches,
                 )
                 hybrid_stats = {}
                 if hybrid_cfg.enabled:
@@ -280,7 +321,7 @@ def main() -> None:
                 record = {
                     "index": idx,
                     "clip_id": clip_id,
-                    "thresholds": combo,
+                    "thresholds": _combo_dict(combo),
                     "duration": duration,
                     "audio": row.get("audio"),
                     "midi": row.get("midi"),
@@ -336,12 +377,19 @@ def main() -> None:
     grid_summaries = []
     for combo, values in sorted(totals.items()):
         summary = summarize_metric_total(values)
-        score = selection_score(summary["note_f1"], summary["offset_f1"], summary["pred_ref_ratio"])
-        row = {"thresholds": combo, "score": score, **summary}
+        score = selection_score(
+            summary["note_f1"],
+            summary["offset_f1"],
+            summary["pred_ref_ratio"],
+            min_pred_ref=float(args.balanced_min_pred_ref),
+            max_pred_ref=float(args.balanced_max_pred_ref),
+        )
+        row = {"combo": combo, "thresholds": _combo_dict(combo), "score": score, **summary}
         grid_summaries.append(row)
         print(
             "amt_summary "
             f"onset_t={combo[0]:.2f} frame_t={combo[1]:.2f} offset_t={combo[2]:.2f} "
+            f"frame_diff={int(combo[3])} frame_diff_scale={combo[4]:.2f} duration_ext={combo[5]:.2f} "
             f"note_p={summary['note_precision']:.4f} note_r={summary['note_recall']:.4f} "
             f"note_f1={summary['note_f1']:.4f} offset_f1={summary['offset_f1']:.4f} "
             f"pred_ref_ratio={summary['pred_ref_ratio']:.3f} "
@@ -355,7 +403,12 @@ def main() -> None:
     assert best_combo is not None
     print(f"amt_best thresholds={best_combo} score={best_score:.4f}", flush=True)
 
-    best_summary = next(row for row in grid_summaries if row["thresholds"] == best_combo)
+    best_summary = next(row for row in grid_summaries if row["combo"] == best_combo)
+    best_note_f1_summary = _best_note_f1_summary(
+        grid_summaries,
+        min_pred_ref=float(args.f1_min_pred_ref),
+        max_pred_ref=float(args.f1_max_pred_ref),
+    )
     best_records = combo_item_records[best_combo]
     if args.score_quality_eval:
         _attach_score_quality_for_combo(
@@ -388,9 +441,14 @@ def main() -> None:
             infer_onsets_from_frame_diff=infer_onsets_from_frame_diff,
             frame_diff_n=frame_diff_n,
             frame_diff_scale=frame_diff_scale,
+            frame_diff_min_onset=frame_diff_min_onset,
+            frame_diff_context_threshold=frame_diff_context_threshold,
+            frame_diff_context_window_frames=frame_diff_context_window_frames,
+            frame_diff_context_min_pitches=frame_diff_context_min_pitches,
             eval_center_only=eval_center_only,
             supervision_margin_seconds=float(target_config.supervision_margin_seconds),
             chord_tolerance_seconds=float(args.chord_tolerance_seconds),
+            max_items=max(0, int(args.score_quality_items)),
             assistant_model=assistant_model,
             assistant_decode_cfg=assistant_decode_cfg,
             assistant_target_config=assistant_target_config,
@@ -403,8 +461,11 @@ def main() -> None:
             "split": args.split,
             "items": len(dataset),
             "decode_preset": args.decode_preset,
-            "best_thresholds": best_combo,
+            "best_thresholds": _combo_dict(best_combo),
+            "balanced_score_threshold": _combo_dict(best_combo),
+            "best_note_f1_threshold": best_note_f1_summary["thresholds"],
             "best_score": best_score,
+            "best_note_f1_score": best_note_f1_summary["note_f1_score"],
             "param_count": model_parameter_count(model),
             "train_manifest_size": manifest_size(cfg.get("train_manifest")),
             "eval_manifest_size": manifest_size(args.manifest),
@@ -413,6 +474,10 @@ def main() -> None:
             "assistant_param_count": assistant_param_count,
             **best_summary,
         },
+        "balanced_score_threshold": _combo_dict(best_combo),
+        "balanced_summary": _json_ready_summary(best_summary),
+        "best_note_f1_threshold": best_note_f1_summary["thresholds"],
+        "best_note_f1_summary": _json_ready_summary(best_note_f1_summary),
         "param_count": model_parameter_count(model),
         "train_manifest_size": manifest_size(cfg.get("train_manifest")),
         "threshold_grid": grid_summaries,
@@ -432,6 +497,7 @@ def main() -> None:
         "hybrid_rescue": hybrid_cfg.to_json() if hybrid_cfg.enabled else {},
         "hybrid": _average_nested(best_records, "hybrid"),
         "teacher_baseline": summarize_metric_total(teacher_total) if teacher_items else {},
+        "pitch_calibration": _pitch_calibration(best_records),
         "worst_items": sorted(best_records, key=lambda item: item["metrics"]["note_f1"])[:20],
         "false_positives": _flatten_limited(best_records, "false_positives", 200),
         "false_negatives": _flatten_limited(best_records, "false_negatives", 200),
@@ -440,11 +506,16 @@ def main() -> None:
         "decode": {
             "consume_note_energy": consume_note_energy,
             "infer_onsets_from_frame_diff": infer_onsets_from_frame_diff,
+            "frame_diff_min_onset": frame_diff_min_onset,
+            "frame_diff_context_threshold": frame_diff_context_threshold,
+            "frame_diff_context_window_frames": frame_diff_context_window_frames,
+            "frame_diff_context_min_pitches": frame_diff_context_min_pitches,
             "eval_center_only": eval_center_only,
             "disable_chord_recovery": disable_chord_recovery,
             "chord_tolerance_seconds": args.chord_tolerance_seconds,
             "duration_buckets": [label for label, _, _ in duration_buckets],
             "assistant_decode_preset": args.assistant_decode_preset if args.assistant_ckpt else None,
+            "score_quality_items": int(args.score_quality_items) if args.score_quality_eval else 0,
         },
     }
     if args.analysis_json_out:
@@ -464,6 +535,73 @@ def _threshold_values(arg_value: str | None, decode_cfg: dict[str, Any], key: st
     if key in decode_cfg:
         return [float(decode_cfg[key])]
     return defaults
+
+
+def _sweep_values(arg_value: str | None, decode_cfg: dict[str, Any], key: str, default: float) -> list[float]:
+    if arg_value:
+        return _floats(arg_value)
+    grid_key = f"{key}s"
+    if grid_key in decode_cfg:
+        return _floats(decode_cfg[grid_key])
+    return [float(default)]
+
+
+def _bool_values(arg_value: str | None, decode_cfg: dict[str, Any], key: str, default: bool) -> list[bool]:
+    if arg_value:
+        return [_parse_bool(part) for part in str(arg_value).split(",") if part.strip()]
+    grid_key = f"{key}s"
+    if grid_key in decode_cfg:
+        value = decode_cfg[grid_key]
+        if isinstance(value, (list, tuple)):
+            return [_parse_bool(item) for item in value]
+        return [_parse_bool(part) for part in str(value).split(",") if part.strip()]
+    return [bool(default)]
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _decode_combos(
+    onset_values: list[float],
+    frame_values: list[float],
+    offset_values: list[float],
+    frame_diff_modes: list[bool],
+    frame_diff_scales: list[float],
+    duration_extension_weights: list[float],
+) -> list[tuple[float, float, float, bool, float, float]]:
+    combos = []
+    for onset_t in onset_values:
+        for frame_t in frame_values:
+            for offset_t in offset_values:
+                for infer_frame_diff in frame_diff_modes:
+                    scales = frame_diff_scales if infer_frame_diff else [frame_diff_scales[0]]
+                    for frame_diff_scale in scales:
+                        for duration_weight in duration_extension_weights:
+                            combos.append(
+                                (
+                                    float(onset_t),
+                                    float(frame_t),
+                                    float(offset_t),
+                                    bool(infer_frame_diff),
+                                    float(frame_diff_scale),
+                                    float(duration_weight),
+                                )
+                            )
+    return combos
+
+
+def _combo_dict(combo: tuple[float, float, float, bool, float, float]) -> dict[str, Any]:
+    return {
+        "onset_threshold": combo[0],
+        "frame_threshold": combo[1],
+        "offset_threshold": combo[2],
+        "infer_onsets_from_frame_diff": combo[3],
+        "frame_diff_scale": combo[4],
+        "duration_extension_weight": combo[5],
+    }
 
 
 def _floats(value: str | float | int | list[float] | tuple[float, ...]) -> list[float]:
@@ -511,6 +649,10 @@ def _decode_notes_from_config(
         infer_onsets_from_frame_diff=bool(decode_cfg.get("infer_onsets_from_frame_diff", False)),
         frame_diff_n=int(decode_cfg.get("frame_diff_n", 2)),
         frame_diff_scale=float(decode_cfg.get("frame_diff_scale", 1.0)),
+        frame_diff_min_onset=float(decode_cfg.get("frame_diff_min_onset", 0.0)),
+        frame_diff_context_threshold=float(decode_cfg.get("frame_diff_context_threshold", 0.0)),
+        frame_diff_context_window_frames=int(decode_cfg.get("frame_diff_context_window_frames", 0)),
+        frame_diff_context_min_pitches=int(decode_cfg.get("frame_diff_context_min_pitches", 0)),
     )
 
 
@@ -557,7 +699,7 @@ def _attach_score_quality_for_combo(
     model: DenseAMT,
     dataset: DenseAMTDataset,
     device: torch.device,
-    combo: tuple[float, float, float],
+    combo: tuple[float, float, float, bool, float, float],
     records: list[dict[str, Any]],
     decode_cfg: dict[str, Any],
     min_note_seconds: float,
@@ -583,9 +725,14 @@ def _attach_score_quality_for_combo(
     infer_onsets_from_frame_diff: bool,
     frame_diff_n: int,
     frame_diff_scale: float,
+    frame_diff_min_onset: float,
+    frame_diff_context_threshold: float,
+    frame_diff_context_window_frames: int,
+    frame_diff_context_min_pitches: int,
     eval_center_only: bool,
     supervision_margin_seconds: float,
     chord_tolerance_seconds: float,
+    max_items: int = 0,
     assistant_model: DenseAMT | None = None,
     assistant_decode_cfg: dict[str, Any] | None = None,
     assistant_target_config: DenseTargetConfig | None = None,
@@ -593,7 +740,10 @@ def _attach_score_quality_for_combo(
 ) -> None:
     del decode_cfg
     records_by_index = {int(record["index"]): record for record in records}
+    processed = 0
     for idx in range(len(dataset)):
+        if max_items > 0 and processed >= max_items:
+            break
         record = records_by_index.get(idx)
         if record is None:
             continue
@@ -623,14 +773,18 @@ def _attach_score_quality_for_combo(
             start_window_seconds=start_window_seconds,
             use_duration_head=use_duration_head,
             max_duration_seconds=max_duration_seconds,
-            duration_extension_weight=duration_extension_weight,
+            duration_extension_weight=combo[5],
             time_shift_clip_frames=time_shift_clip_frames,
             consume_note_energy=consume_note_energy,
             energy_neighbor_pitches=energy_neighbor_pitches,
             energy_overlap_ratio=energy_overlap_ratio,
-            infer_onsets_from_frame_diff=infer_onsets_from_frame_diff,
+            infer_onsets_from_frame_diff=combo[3],
             frame_diff_n=frame_diff_n,
-            frame_diff_scale=frame_diff_scale,
+            frame_diff_scale=combo[4],
+            frame_diff_min_onset=frame_diff_min_onset,
+            frame_diff_context_threshold=frame_diff_context_threshold,
+            frame_diff_context_window_frames=frame_diff_context_window_frames,
+            frame_diff_context_min_pitches=frame_diff_context_min_pitches,
         )
         if hybrid_cfg is not None and hybrid_cfg.enabled and assistant_model is not None and assistant_decode_cfg is not None:
             assistant_notes = _decode_notes_from_config(
@@ -653,15 +807,48 @@ def _attach_score_quality_for_combo(
             chord_tolerance_seconds=chord_tolerance_seconds,
         )
         record["score_notation"] = record["score_quality"].get("score_notation", {})
+        processed += 1
+    print(f"score_quality_items={processed}", flush=True)
 
 
-def selection_score(note_f1: float, offset_f1: float, pred_ref_ratio: float) -> float:
+def selection_score(
+    note_f1: float,
+    offset_f1: float,
+    pred_ref_ratio: float,
+    min_pred_ref: float = 0.90,
+    max_pred_ref: float = 1.15,
+) -> float:
     if pred_ref_ratio <= 0:
         return -1e9
     ratio_error = abs(math.log(max(1e-6, pred_ref_ratio)))
-    over_generation = max(0.0, pred_ref_ratio - 1.35)
-    under_generation = max(0.0, 0.55 - pred_ref_ratio)
+    over_generation = max(0.0, pred_ref_ratio - max_pred_ref)
+    under_generation = max(0.0, min_pred_ref - pred_ref_ratio)
     return 10.0 * note_f1 + offset_f1 - 1.15 * ratio_error - 0.65 * over_generation - 0.35 * under_generation
+
+
+def _best_note_f1_summary(
+    rows: list[dict[str, Any]],
+    min_pred_ref: float,
+    max_pred_ref: float,
+) -> dict[str, Any]:
+    def score(row: dict[str, Any]) -> tuple[float, float, float, float]:
+        pred_ref = float(row.get("pred_ref_ratio", 0.0))
+        outside = max(0.0, float(min_pred_ref) - pred_ref, pred_ref - float(max_pred_ref))
+        return (
+            float(row.get("note_f1", 0.0)) - 0.05 * outside,
+            float(row.get("offset_f1", 0.0)),
+            -outside,
+            -abs(math.log(max(1e-6, pred_ref))) if pred_ref > 0 else -999.0,
+        )
+
+    best = max(rows, key=score)
+    out = dict(best)
+    out["note_f1_score"] = score(best)[0]
+    return out
+
+
+def _json_ready_summary(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if key != "combo"}
 
 
 def _maybe_center_crop_notes(
@@ -724,6 +911,40 @@ def _flatten_limited(records: list[dict[str, Any]], key: str, limit: int) -> lis
         if len(out) >= limit:
             return out[:limit]
     return out
+
+
+def _pitch_calibration(records: list[dict[str, Any]]) -> dict[str, Any]:
+    stats: dict[int, dict[str, float]] = {}
+    for record in records:
+        for item in record.get("false_positives", []):
+            pitch = int(item["pitch"])
+            stats.setdefault(pitch, {"false_positives": 0.0, "false_negatives": 0.0})
+            stats[pitch]["false_positives"] += 1.0
+        for item in record.get("false_negatives", []):
+            pitch = int(item["pitch"])
+            stats.setdefault(pitch, {"false_positives": 0.0, "false_negatives": 0.0})
+            stats[pitch]["false_negatives"] += 1.0
+    rows = []
+    for pitch, row in sorted(stats.items()):
+        fp = float(row["false_positives"])
+        fn = float(row["false_negatives"])
+        denom = max(1.0, fp + fn)
+        # Positive bias means raise this pitch threshold; negative means lower it.
+        threshold_bias_hint = max(-0.08, min(0.08, 0.08 * (fp - fn) / denom))
+        rows.append(
+            {
+                "pitch": pitch,
+                "false_positives": fp,
+                "false_negatives": fn,
+                "net_fp_minus_fn": fp - fn,
+                "threshold_bias_hint": threshold_bias_hint,
+            }
+        )
+    return {
+        "by_pitch": rows,
+        "top_false_positive_pitches": sorted(rows, key=lambda item: item["false_positives"], reverse=True)[:12],
+        "top_false_negative_pitches": sorted(rows, key=lambda item: item["false_negatives"], reverse=True)[:12],
+    }
 
 
 def _error_notes_for_midi(records: list[dict[str, Any]]) -> list[NoteEvent]:

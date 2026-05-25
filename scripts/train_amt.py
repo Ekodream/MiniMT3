@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from minimt3.amt.data import DenseAMTCollator, DenseAMTDataset
 from minimt3.amt.decode import decode_dense_notes
+from minimt3.amt.analysis import add_metric_total, detailed_note_metrics, new_metric_total, summarize_metric_total
 from minimt3.amt.loss import DenseAMTLoss
 from minimt3.amt.model import DenseAMT, DenseAMTConfig
 from minimt3.amt.presets import apply_decode_preset
@@ -54,6 +55,7 @@ def main() -> None:
         max_items=cfg.get("max_items"),
         cache_dir=cfg.get("train_cache_dir"),
         target_config=target_cfg,
+        teacher_midi_dir=cfg.get("teacher_midi_dir"),
     )
     val_ds = DenseAMTDataset(
         cfg["val_manifest"],
@@ -73,7 +75,7 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
         persistent_workers=int(cfg.get("num_workers", 4)) > 0,
         prefetch_factor=int(cfg.get("prefetch_factor", 2)) if int(cfg.get("num_workers", 4)) > 0 else None,
-        collate_fn=DenseAMTCollator(),
+        collate_fn=DenseAMTCollator(_sample_weight_by_category(cfg)),
         drop_last=is_ddp,
     )
     val_loader = DataLoader(
@@ -149,6 +151,7 @@ def main() -> None:
                 loss = loss_out.loss
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            _mask_frozen_gradients(model, cfg, global_step, rank)
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.get("grad_clip", 1.0)))
             scaler.step(optimizer)
             scaler.update()
@@ -166,6 +169,14 @@ def main() -> None:
                     eval_model = model.module if hasattr(model, "module") else model
                     val = evaluate(eval_model, val_loader, criterion, device, use_amp, amp_dtype, cfg)
                     print(f"step={global_step} val_loss={val['loss']:.4f} {val['losses']}", flush=True)
+                    if bool(cfg.get("save_predebug_checkpoint", True)):
+                        save_checkpoint(
+                            out_dir / f"step_{global_step}_predebug.pt",
+                            eval_model,
+                            cfg,
+                            global_step,
+                            best_score,
+                        )
                     debug = debug_decode(eval_model, val_ds, device, cfg, global_step)
                     score = selection_score(debug, cfg)
                     print(f"checkpoint_selection score={score:.5f} best={best_score:.5f}", flush=True)
@@ -174,9 +185,9 @@ def main() -> None:
                     if improved:
                         best_score = score
                         best_step = global_step
-                        save_checkpoint(out_dir / "best.pt", eval_model, cfg, global_step, best_score)
+                        save_checkpoint(out_dir / "best.pt", eval_model, cfg, global_step, best_score, debug)
                     if global_step % int(cfg.get("save_interval", 300)) == 0:
-                        save_checkpoint(out_dir / f"step_{global_step}.pt", eval_model, cfg, global_step, score)
+                        save_checkpoint(out_dir / f"step_{global_step}.pt", eval_model, cfg, global_step, score, debug)
                     patience_evals = int(cfg.get("early_stop_patience_evals", 0) or 0)
                     early_stop_min_steps = int(cfg.get("early_stop_min_steps", 0) or 0)
                     if (
@@ -214,6 +225,43 @@ def lr_factor(step: int, warmup: int, max_steps: int, base_lr: float, min_lr: fl
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     min_factor = min_lr / max(base_lr, 1e-12)
     return min_factor + (1.0 - min_factor) * cosine
+
+
+def _sample_weight_by_category(cfg: dict[str, Any]) -> dict[str, float]:
+    weights = cfg.get("hard_category_weights") or cfg.get("sample_weight_by_category") or {}
+    if not isinstance(weights, dict):
+        return {}
+    return {str(key): float(value) for key, value in weights.items()}
+
+
+def _mask_frozen_gradients(model: torch.nn.Module, cfg: dict[str, Any], global_step: int, rank: int) -> None:
+    freeze_steps = int(cfg.get("freeze_backbone_steps", 0) or 0)
+    if freeze_steps <= 0 or global_step >= freeze_steps:
+        return
+    patterns = tuple(str(item) for item in cfg.get("trainable_patterns_during_freeze", []) or ())
+    if not patterns:
+        patterns = (
+            "duration_bucket_head",
+            "duration_head",
+            "onset_shift_head",
+            "offset_shift_head",
+            "onset_condition_fc",
+            "frame_condition_fc",
+        )
+    target = model.module if hasattr(model, "module") else model
+    if global_step == 0 and rank == 0:
+        print(
+            "freeze_backbone "
+            f"steps={freeze_steps} trainable_patterns={list(patterns)}",
+            flush=True,
+        )
+    for name, param in target.named_parameters():
+        if param.grad is None:
+            continue
+        if any(pattern in name for pattern in patterns):
+            continue
+        param.grad.detach_()
+        param.grad.zero_()
 
 
 @torch.no_grad()
@@ -288,20 +336,8 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
     decode_cfg = apply_decode_preset(cfg.get("decode", {}), cfg.get("decode_preset"))
     combos = _debug_decode_combos(cfg, decode_cfg)
     max_items = min(int(cfg.get("debug_items", 8)), len(dataset))
-    totals = {
-        combo: {
-            "note_precision": 0.0,
-            "note_recall": 0.0,
-            "note_f1": 0.0,
-            "offset_precision": 0.0,
-            "offset_recall": 0.0,
-            "offset_f1": 0.0,
-            "pred": 0,
-            "ref": 0,
-            "bad_clips": 0,
-        }
-        for combo in combos
-    }
+    totals = {combo: new_metric_total() for combo in combos}
+    bad_clips = {combo: 0 for combo in combos}
     for idx in range(max_items):
         sample = dataset[idx]
         features = sample["features"].unsqueeze(0).to(device)
@@ -311,6 +347,10 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
         chord_onset_threshold = decode_cfg.get("chord_onset_threshold")
         if bool(decode_cfg.get("disable_chord_recovery", False)):
             chord_onset_threshold = None
+        frame_diff_min_onset = float(decode_cfg.get("frame_diff_min_onset", 0.0))
+        frame_diff_context_threshold = float(decode_cfg.get("frame_diff_context_threshold", 0.0))
+        frame_diff_context_window_frames = int(decode_cfg.get("frame_diff_context_window_frames", 0))
+        frame_diff_context_min_pitches = int(decode_cfg.get("frame_diff_context_min_pitches", 0))
         ref_notes, _ = load_midi_events(row["midi"], start=float(row["start_sec"]), end=float(row["end_sec"]))
         best_item = None
         for combo in combos:
@@ -335,27 +375,24 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
                 start_window_seconds=float(decode_cfg.get("start_window_seconds", 0.08)),
                 use_duration_head=bool(decode_cfg.get("use_duration_head", True)),
                 max_duration_seconds=float(decode_cfg.get("max_duration_seconds", 8.0)),
-                duration_extension_weight=float(decode_cfg.get("duration_extension_weight", 1.0)),
+                duration_extension_weight=combo[5],
                 time_shift_clip_frames=float(cfg.get("targets", {}).get("time_shift_clip_frames", 1.0)),
                 consume_note_energy=bool(decode_cfg.get("consume_note_energy", False)),
                 energy_neighbor_pitches=int(decode_cfg.get("energy_neighbor_pitches", 1)),
                 energy_overlap_ratio=float(decode_cfg.get("energy_overlap_ratio", 0.5)),
-                infer_onsets_from_frame_diff=bool(decode_cfg.get("infer_onsets_from_frame_diff", False)),
+                infer_onsets_from_frame_diff=combo[3],
                 frame_diff_n=int(decode_cfg.get("frame_diff_n", 2)),
-                frame_diff_scale=float(decode_cfg.get("frame_diff_scale", 1.0)),
+                frame_diff_scale=combo[4],
+                frame_diff_min_onset=frame_diff_min_onset,
+                frame_diff_context_threshold=frame_diff_context_threshold,
+                frame_diff_context_window_frames=frame_diff_context_window_frames,
+                frame_diff_context_min_pitches=frame_diff_context_min_pitches,
             )
             eval_notes, eval_ref_notes = _maybe_center_crop_notes(notes, ref_notes, row, cfg)
-            metric = note_metrics(eval_notes, eval_ref_notes)
-            totals[combo]["note_precision"] += metric["note_precision"]
-            totals[combo]["note_recall"] += metric["note_recall"]
-            totals[combo]["note_f1"] += metric["note_f1"]
-            totals[combo]["offset_precision"] += metric["offset_precision"]
-            totals[combo]["offset_recall"] += metric["offset_recall"]
-            totals[combo]["offset_f1"] += metric["offset_f1"]
-            totals[combo]["pred"] += len(eval_notes)
-            totals[combo]["ref"] += len(eval_ref_notes)
+            metric = detailed_note_metrics(eval_notes, eval_ref_notes)
+            add_metric_total(totals[combo], metric)
             if metric["note_f1"] < float(cfg.get("bad_clip_f1_threshold", 0.05)):
-                totals[combo]["bad_clips"] += 1
+                bad_clips[combo] += 1
             candidate = (metric["note_f1"], metric["offset_f1"], -len(eval_notes), combo, len(eval_notes), len(eval_ref_notes))
             if best_item is None or candidate[:4] > best_item[:4]:
                 best_item = candidate
@@ -370,22 +407,14 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
     count = max(1, max_items)
     best_summary = None
     best_score = -math.inf
+    summary_rows = []
     for combo, values in sorted(totals.items()):
-        pred_ref = values["pred"] / max(1, values["ref"])
-        summary = {
-            "note_precision": values["note_precision"] / count,
-            "note_recall": values["note_recall"] / count,
-            "note_f1": values["note_f1"] / count,
-            "offset_precision": values["offset_precision"] / count,
-            "offset_recall": values["offset_recall"] / count,
-            "offset_f1": values["offset_f1"] / count,
-            "pred_ref_ratio": pred_ref,
-            "bad_clip_rate": values["bad_clips"] / count,
-            "pred_notes": values["pred"],
-            "ref_notes": values["ref"],
-            "thresholds": combo,
-        }
+        summary = summarize_metric_total(values)
+        summary["bad_clip_rate"] = bad_clips[combo] / count
+        summary["thresholds"] = combo
+        pred_ref = summary["pred_ref_ratio"]
         score = selection_score(summary, cfg)
+        summary_rows.append({**summary, "score": score})
         if len(combos) > 1:
             print(
                 "debug_amt_sweep "
@@ -399,6 +428,11 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
             best_score = score
             best_summary = summary
     assert best_summary is not None
+    best_f1_summary = _best_note_f1_summary(summary_rows, cfg)
+    best_summary["best_note_f1_summary"] = best_f1_summary
+    best_summary["balanced_summary"] = {
+        key: value for key, value in best_summary.items() if key not in {"best_note_f1_summary", "balanced_summary"}
+    }
     print(
         "debug_amt_summary "
         f"step={step} thresholds={best_summary['thresholds']} "
@@ -409,25 +443,52 @@ def debug_decode(model, dataset: DenseAMTDataset, device, cfg: dict[str, Any], s
         f"pred_notes={best_summary['pred_notes']} ref_notes={best_summary['ref_notes']}",
         flush=True,
     )
+    print(
+        "debug_amt_best_f1 "
+        f"step={step} thresholds={best_f1_summary['thresholds']} "
+        f"note_f1={best_f1_summary['note_f1']:.4f} offset_f1={best_f1_summary['offset_f1']:.4f} "
+        f"note_p={best_f1_summary['note_precision']:.4f} note_r={best_f1_summary['note_recall']:.4f} "
+        f"pred_ref_ratio={best_f1_summary['pred_ref_ratio']:.3f}",
+        flush=True,
+    )
     if was_training:
         model.train()
     return best_summary
 
 
-def _debug_decode_combos(cfg: dict[str, Any], decode_cfg: dict[str, Any]) -> list[tuple[float, float, float]]:
-    sweep = cfg.get("selection_sweep") or cfg.get("eval", {}).get("selection_sweep")
+def _debug_decode_combos(cfg: dict[str, Any], decode_cfg: dict[str, Any]) -> list[tuple[float, float, float, bool, float, float]]:
+    sweep = cfg.get("debug_selection_sweep") or cfg.get("selection_sweep") or cfg.get("eval", {}).get("selection_sweep")
     if not sweep or not bool(sweep.get("enabled", False)):
         return [
             (
                 float(decode_cfg.get("onset_threshold", 0.45)),
                 float(decode_cfg.get("frame_threshold", 0.35)),
                 float(decode_cfg.get("offset_threshold", 0.35)),
+                bool(decode_cfg.get("infer_onsets_from_frame_diff", False)),
+                float(decode_cfg.get("frame_diff_scale", 1.0)),
+                float(decode_cfg.get("duration_extension_weight", 1.0)),
             )
         ]
     onset_values = _float_values(sweep.get("onset_thresholds", decode_cfg.get("onset_threshold", 0.45)))
     frame_values = _float_values(sweep.get("frame_thresholds", decode_cfg.get("frame_threshold", 0.35)))
     offset_values = _float_values(sweep.get("offset_thresholds", decode_cfg.get("offset_threshold", 0.35)))
-    return [(o, f, off) for o in onset_values for f in frame_values for off in offset_values]
+    frame_diff_modes = _bool_values(
+        sweep.get("frame_diff_modes", sweep.get("infer_onsets_from_frame_diff", decode_cfg.get("infer_onsets_from_frame_diff", False)))
+    )
+    frame_diff_scales = _float_values(sweep.get("frame_diff_scales", decode_cfg.get("frame_diff_scale", 1.0)))
+    duration_extension_weights = _float_values(
+        sweep.get("duration_extension_weights", decode_cfg.get("duration_extension_weight", 1.0))
+    )
+    combos = []
+    for o in onset_values:
+        for f in frame_values:
+            for off in offset_values:
+                for infer_frame_diff in frame_diff_modes:
+                    scales = frame_diff_scales if infer_frame_diff else [frame_diff_scales[0]]
+                    for frame_diff_scale in scales:
+                        for duration_weight in duration_extension_weights:
+                            combos.append((o, f, off, infer_frame_diff, frame_diff_scale, duration_weight))
+    return combos
 
 
 def _float_values(value: Any) -> list[float]:
@@ -436,6 +497,20 @@ def _float_values(value: Any) -> list[float]:
     if isinstance(value, (list, tuple)):
         return [float(x) for x in value]
     return [float(part.strip()) for part in str(value).split(",") if part.strip()]
+
+
+def _bool_values(value: Any) -> list[bool]:
+    if isinstance(value, bool):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [_parse_bool(item) for item in value]
+    return [_parse_bool(part) for part in str(value).split(",") if part.strip()]
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def selection_score(debug: dict[str, float], cfg: dict[str, Any] | None = None) -> float:
@@ -456,6 +531,24 @@ def selection_score(debug: dict[str, float], cfg: dict[str, Any] | None = None) 
         - float(selection.get("under_generation_penalty", 0.35)) * under_generation
         - float(selection.get("bad_clip_penalty", 1.0)) * float(debug.get("bad_clip_rate", 0.0))
     )
+
+
+def _best_note_f1_summary(rows: list[dict[str, float]], cfg: dict[str, Any] | None = None) -> dict[str, float]:
+    selection = (cfg or {}).get("selection", {})
+    min_ratio = float(selection.get("f1_min_pred_ref_ratio", 0.78))
+    max_ratio = float(selection.get("f1_max_pred_ref_ratio", 1.20))
+
+    def score(row: dict[str, float]) -> tuple[float, float, float, float]:
+        pred_ref = float(row.get("pred_ref_ratio", 0.0))
+        outside = max(0.0, min_ratio - pred_ref, pred_ref - max_ratio)
+        return (
+            float(row.get("note_f1", 0.0)) - 0.05 * outside,
+            float(row.get("offset_f1", 0.0)),
+            -outside,
+            -abs(math.log(max(1e-6, pred_ref))) if pred_ref > 0 else -999.0,
+        )
+
+    return dict(max(rows, key=score))
 
 
 def note_metrics(pred_notes: list[NoteEvent], ref_notes: list[NoteEvent]) -> dict[str, float]:
@@ -627,10 +720,22 @@ def _copy_gru_gates(target: torch.Tensor, source: torch.Tensor) -> None:
             )
 
 
-def save_checkpoint(path: str | Path, model: DenseAMT, cfg: dict[str, Any], step: int, score: float) -> None:
+def save_checkpoint(
+    path: str | Path,
+    model: DenseAMT,
+    cfg: dict[str, Any],
+    step: int,
+    score: float,
+    debug_summary: dict[str, Any] | None = None,
+) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": model.state_dict(), "config": cfg, "step": step, "score": score}, path)
+    payload = {"model": model.state_dict(), "config": cfg, "step": step, "score": score}
+    if debug_summary:
+        payload["balanced_summary"] = debug_summary.get("balanced_summary", debug_summary)
+        payload["best_f1_summary"] = debug_summary.get("best_note_f1_summary", {})
+        payload["debug_summary"] = debug_summary
+    torch.save(payload, path)
     print(f"saved {path}", flush=True)
 
 

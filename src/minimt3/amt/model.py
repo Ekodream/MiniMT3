@@ -22,6 +22,8 @@ class DenseAMTConfig:
     head_hidden: int = 256
     predict_pedal: bool = False
     predict_duration: bool = False
+    predict_duration_bucket: bool = False
+    duration_bucket_count: int = 4
     predict_time_shifts: bool = False
     onset_conditioned_frame: bool = False
     position_encoding: str = "none"
@@ -154,10 +156,17 @@ class DenseAMT(nn.Module):
         self.velocity_head = nn.Linear(config.head_hidden, 88)
         self.pedal_head = nn.Linear(config.head_hidden, 1) if config.predict_pedal else None
         self.duration_head = nn.Linear(config.head_hidden, 88) if config.predict_duration else None
+        self.duration_bucket_head = (
+            nn.Linear(config.head_hidden, 88 * int(config.duration_bucket_count))
+            if config.predict_duration_bucket
+            else None
+        )
         self.onset_shift_head = nn.Linear(config.head_hidden, 88) if config.predict_time_shifts else None
         self.offset_shift_head = nn.Linear(config.head_hidden, 88) if config.predict_time_shifts else None
         if self.duration_head is not None:
             nn.init.constant_(self.duration_head.bias, -2.2)
+        if self.duration_bucket_head is not None:
+            nn.init.zeros_(self.duration_bucket_head.bias)
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         if self.backend is not None:
@@ -193,6 +202,14 @@ class DenseAMT(nn.Module):
             out["pedal_logits"] = self.pedal_head(hidden)
         if self.duration_head is not None:
             out["duration_logits"] = self.duration_head(hidden)
+        if self.duration_bucket_head is not None:
+            bucket_count = int(self.config.duration_bucket_count)
+            out["duration_bucket_logits"] = self.duration_bucket_head(hidden).view(
+                hidden.shape[0],
+                hidden.shape[1],
+                88,
+                bucket_count,
+            )
         if self.onset_shift_head is not None and self.offset_shift_head is not None:
             out["onset_shift_logits"] = self.onset_shift_head(onset_hidden)
             out["offset_shift_logits"] = self.offset_shift_head(offset_hidden)
@@ -270,6 +287,11 @@ class ByteDanceStyleCRNN(nn.Module):
         self.onset_shift_head = nn.Linear(cond_hidden * 2, 88) if config.predict_time_shifts else None
         self.offset_shift_head = nn.Linear(config.acoustic_rnn_hidden * 2, 88) if config.predict_time_shifts else None
         self.duration_head = nn.Linear(cond_hidden * 2, 88) if config.predict_duration else None
+        self.duration_bucket_head = (
+            nn.Linear(cond_hidden * 2, 88 * int(config.duration_bucket_count))
+            if config.predict_duration_bucket
+            else None
+        )
         self._init_condition_layers()
 
     def _init_condition_layers(self) -> None:
@@ -277,7 +299,14 @@ class ByteDanceStyleCRNN(nn.Module):
         nn.init.zeros_(self.bn0.bias)
         for gru in (self.onset_condition_gru, self.frame_condition_gru):
             _init_gru(gru)
-        for layer in (self.onset_condition_fc, self.frame_condition_fc, self.onset_shift_head, self.offset_shift_head, self.duration_head):
+        for layer in (
+            self.onset_condition_fc,
+            self.frame_condition_fc,
+            self.onset_shift_head,
+            self.offset_shift_head,
+            self.duration_head,
+            self.duration_bucket_head,
+        ):
             if layer is not None:
                 nn.init.xavier_uniform_(layer.weight)
                 nn.init.zeros_(layer.bias)
@@ -326,6 +355,14 @@ class ByteDanceStyleCRNN(nn.Module):
             out["offset_shift_logits"] = self.offset_shift_head(offset_hidden)
         if self.duration_head is not None:
             out["duration_logits"] = self.duration_head(frame_hidden)
+        if self.duration_bucket_head is not None:
+            bucket_count = int(self.config.duration_bucket_count)
+            out["duration_bucket_logits"] = self.duration_bucket_head(frame_hidden).view(
+                frame_hidden.shape[0],
+                frame_hidden.shape[1],
+                88,
+                bucket_count,
+            )
         return out
 
 

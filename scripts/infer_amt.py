@@ -78,6 +78,10 @@ def main() -> None:
     parser.add_argument("--disable_infer_onsets_from_frame_diff", action="store_true")
     parser.add_argument("--frame_diff_n", type=int)
     parser.add_argument("--frame_diff_scale", type=float)
+    parser.add_argument("--frame_diff_min_onset", type=float)
+    parser.add_argument("--frame_diff_context_threshold", type=float)
+    parser.add_argument("--frame_diff_context_window_frames", type=int)
+    parser.add_argument("--frame_diff_context_min_pitches", type=int)
     parser.add_argument("--pedal_threshold", type=float)
     parser.add_argument("--disable_sustain_heuristic", action="store_true")
     parser.add_argument("--performance_min_note_seconds", type=float)
@@ -119,6 +123,8 @@ def main() -> None:
     parser.add_argument("--score_start_offset_seconds", type=float)
     parser.add_argument("--score_chord_snap_seconds", type=float)
     parser.add_argument("--score_chord_snap_max_spread_beats", type=float)
+    parser.add_argument("--score_disable_chord_duration_lock", action="store_true")
+    parser.add_argument("--score_chord_lock_max_duration_spread_beats", type=float)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -229,6 +235,26 @@ def main() -> None:
     frame_diff_scale = float(
         args.frame_diff_scale if args.frame_diff_scale is not None else decode_cfg.get("frame_diff_scale", 1.0)
     )
+    frame_diff_min_onset = float(
+        args.frame_diff_min_onset
+        if args.frame_diff_min_onset is not None
+        else decode_cfg.get("frame_diff_min_onset", 0.0)
+    )
+    frame_diff_context_threshold = float(
+        args.frame_diff_context_threshold
+        if args.frame_diff_context_threshold is not None
+        else decode_cfg.get("frame_diff_context_threshold", 0.0)
+    )
+    frame_diff_context_window_frames = int(
+        args.frame_diff_context_window_frames
+        if args.frame_diff_context_window_frames is not None
+        else decode_cfg.get("frame_diff_context_window_frames", 0)
+    )
+    frame_diff_context_min_pitches = int(
+        args.frame_diff_context_min_pitches
+        if args.frame_diff_context_min_pitches is not None
+        else decode_cfg.get("frame_diff_context_min_pitches", 0)
+    )
     decode_center_only = bool(decode_cfg.get("decode_center_only", False))
     reliable_margin_seconds = float(
         decode_cfg.get("reliable_margin_seconds", target_cfg.get("supervision_margin_seconds", 0.0) or 0.0)
@@ -300,6 +326,14 @@ def main() -> None:
         args.score_chord_snap_max_spread_beats
         if args.score_chord_snap_max_spread_beats is not None
         else score_cfg.get("score_chord_snap_max_spread_beats", 0.25)
+    )
+    score_lock_chord_durations = bool(
+        score_cfg.get("score_lock_chord_durations", True)
+    ) and not args.score_disable_chord_duration_lock
+    score_chord_lock_max_duration_spread_beats = float(
+        args.score_chord_lock_max_duration_spread_beats
+        if args.score_chord_lock_max_duration_spread_beats is not None
+        else score_cfg.get("score_chord_lock_max_duration_spread_beats", 0.75)
     )
     audio_cfg = LogMelConfig(**cfg.get("audio", {}))
     model = DenseAMT(DenseAMTConfig(**cfg.get("model", {}))).to(device)
@@ -386,6 +420,10 @@ def main() -> None:
                 infer_onsets_from_frame_diff=infer_onsets_from_frame_diff,
                 frame_diff_n=frame_diff_n,
                 frame_diff_scale=frame_diff_scale,
+                frame_diff_min_onset=frame_diff_min_onset,
+                frame_diff_context_threshold=frame_diff_context_threshold,
+                frame_diff_context_window_frames=frame_diff_context_window_frames,
+                frame_diff_context_min_pitches=frame_diff_context_min_pitches,
             )
             before_center_notes = len(window_notes)
             if decode_center_only and reliable_margin_seconds > 0.0 and end - start > reliable_margin_seconds * 2.0:
@@ -515,6 +553,8 @@ def main() -> None:
                 start_offset_seconds=args.score_start_offset_seconds,
                 chord_snap_seconds=score_chord_snap_seconds,
                 chord_snap_max_spread_beats=score_chord_snap_max_spread_beats,
+                lock_chord_durations=score_lock_chord_durations,
+                chord_lock_max_duration_spread_beats=score_chord_lock_max_duration_spread_beats,
             ),
         )
         score_notes = polished.notes
@@ -615,6 +655,10 @@ def main() -> None:
                 "infer_onsets_from_frame_diff": infer_onsets_from_frame_diff,
                 "frame_diff_n": frame_diff_n,
                 "frame_diff_scale": frame_diff_scale,
+                "frame_diff_min_onset": frame_diff_min_onset,
+                "frame_diff_context_threshold": frame_diff_context_threshold,
+                "frame_diff_context_window_frames": frame_diff_context_window_frames,
+                "frame_diff_context_min_pitches": frame_diff_context_min_pitches,
                 "decode_center_only": decode_center_only,
                 "reliable_margin_seconds": reliable_margin_seconds,
                 "pedal_threshold": pedal_threshold,
@@ -654,6 +698,8 @@ def main() -> None:
                 "score_start_offset_seconds": args.score_start_offset_seconds,
                 "score_chord_snap_seconds": score_chord_snap_seconds,
                 "score_chord_snap_max_spread_beats": score_chord_snap_max_spread_beats,
+                "score_lock_chord_durations": score_lock_chord_durations,
+                "score_chord_lock_max_duration_spread_beats": score_chord_lock_max_duration_spread_beats,
                 "assistant_ckpt": args.assistant_ckpt,
                 "assistant_decode_preset": args.assistant_decode_preset if args.assistant_ckpt else None,
             },
@@ -726,6 +772,10 @@ def _decode_notes_from_config(
         infer_onsets_from_frame_diff=bool(decode_cfg.get("infer_onsets_from_frame_diff", False)),
         frame_diff_n=int(decode_cfg.get("frame_diff_n", 2)),
         frame_diff_scale=float(decode_cfg.get("frame_diff_scale", 1.0)),
+        frame_diff_min_onset=float(decode_cfg.get("frame_diff_min_onset", 0.0)),
+        frame_diff_context_threshold=float(decode_cfg.get("frame_diff_context_threshold", 0.0)),
+        frame_diff_context_window_frames=int(decode_cfg.get("frame_diff_context_window_frames", 0)),
+        frame_diff_context_min_pitches=int(decode_cfg.get("frame_diff_context_min_pitches", 0)),
     )
 
 
