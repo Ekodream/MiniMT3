@@ -1,0 +1,25 @@
+\begin{tikzpicture}[
+  font=\small,
+  node distance=7mm and 8mm,
+  block/.style={draw, rounded corners=2pt, align=center, minimum width=30mm, minimum height=9mm, fill=blue!5},
+  gate/.style={draw, diamond, aspect=2.4, align=center, inner sep=1pt, fill=yellow!15},
+  output/.style={draw, rounded corners=2pt, align=center, minimum width=31mm, minimum height=9mm, fill=green!8},
+  arrow/.style={-{Latex[length=2mm]}, thick}
+]
+\node[block] (v13) {基础转录器\\初始音符事件};
+\node[block, below=10mm of v13] (v19) {辅助转录器\\高置信候选};
+\node[gate, right=13mm of v13] (context) {上下文\\门控};
+\node[gate, right=of context] (budget) {预算与\\密度限制};
+\node[output, right=of budget] (out) {修正后事件\\补和弦/长音};
+
+\draw[arrow] (v13) -- (context);
+\draw[arrow] (v19) -| (context);
+\draw[arrow] (context) -- node[above]{通过} (budget);
+\draw[arrow] (budget) -- (out);
+\draw[arrow] (v13) |- ([yshift=-5mm]out.west);
+
+\node[align=left, below=8mm of budget, text width=76mm] {
+接受条件：近 onset 和弦缺音、低音长音、同 pitch 近 onset 的长音延长。\\
+拒绝条件：孤立短音、重复音、超过补音预算或超过每秒音符密度。
+};
+\end{tikzpicture}

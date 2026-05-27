@@ -1,0 +1,31 @@
+\begin{tikzpicture}[
+  font=\small,
+  node distance=6mm and 7mm,
+  block/.style={draw, rounded corners=2pt, align=center, minimum width=24mm, minimum height=9mm, fill=blue!5},
+  stage/.style={draw, rounded corners=2pt, align=center, minimum width=27mm, minimum height=9mm, fill=green!7},
+  output/.style={draw, rounded corners=2pt, align=center, minimum width=26mm, minimum height=9mm, fill=orange!10},
+  arrow/.style={-{Latex[length=2mm]}, thick}
+]
+\node[block] (audio) {输入音频};
+\node[block, right=of audio] (prep) {声学前端\\对数 Mel 表示};
+\node[block, right=of prep] (slice) {固定长度切片\\中心监督};
+\node[stage, right=of slice] (amt) {多任务音符事件预测};
+
+\node[stage, below=9mm of amt] (decode) {上下文约束解码\\与事件恢复};
+\node[stage, left=of decode] (hybrid) {辅助修正分支};
+\node[output, right=of decode] (midi) {事件级输出};
+\node[stage, below=9mm of decode] (score) {谱面导向后处理};
+\node[output, right=of score] (xml) {乐谱级输出};
+
+\draw[arrow] (audio) -- (prep);
+\draw[arrow] (prep) -- (slice);
+\draw[arrow] (slice) -- (amt);
+\draw[arrow] (amt) -- (decode);
+\draw[arrow, dashed] (amt) |- (hybrid);
+\draw[arrow] (decode) -- (midi);
+\draw[arrow] (decode) -- (score);
+\draw[arrow] (hybrid) -- (decode);
+\draw[arrow] (score) -- (xml);
+
+\node[draw, dashed, rounded corners=2pt, fit=(decode)(midi)(score)(xml), inner sep=5pt, label=below:{双层结构：事件恢复与乐谱整理}] {};
+\end{tikzpicture}

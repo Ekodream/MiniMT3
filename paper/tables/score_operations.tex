@@ -1,0 +1,18 @@
+\begin{table}[H]
+\centering
+\caption{谱面整理层的主要操作}
+\label{tab:score_operations}
+\small
+\begin{tabularx}{\linewidth}{llX}
+\toprule
+操作 & 处理对象 & 主要解决的问题 \\
+\midrule
+短音过滤与重复合并 & 孤立短音、近邻重复音 & 减少由误检或局部抖动造成的碎音。 \\
+小节感知量化 & onset、offset、duration & 将演奏时间映射到稳定节拍网格，降低视觉碎片化。 \\
+和弦锁定 & 近 onset 垂直音组 & 保持同一和弦内音符垂直对齐，减少和弦拆散。 \\
+双谱表双声部分配 & 左右手与持续音 & 区分旋律、伴奏和低音保持，降低声部碰撞。 \\
+长音连线 & 跨拍、跨小节长音 & 用连线表示持续音，避免长音被休止符打断。 \\
+冗余休止符抑制 & filler rests & 隐藏非必要填充休止符，提高 MusicXML 视觉可读性。 \\
+\bottomrule
+\end{tabularx}
+\end{table}

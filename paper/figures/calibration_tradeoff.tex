@@ -1,0 +1,25 @@
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar,
+    width=0.92\linewidth,
+    height=6cm,
+    ymin=0,
+    ymax=1.05,
+    ylabel={数值},
+    symbolic x coords={Base,Balanced,Precision,P-1800},
+    xtick=data,
+    bar width=7pt,
+    enlarge x limits=0.18,
+    legend style={at={(0.5,1.03)},anchor=south,legend columns=3},
+]
+\addplot coordinates {(Base,0.5400) (Balanced,0.5932) (Precision,0.6916) (P-1800,0.6897)};
+\addplot coordinates {(Base,0.5288) (Balanced,0.5671) (Precision,0.5208) (P-1800,0.5184)};
+\addplot coordinates {(Base,0.9793) (Balanced,0.9561) (Precision,0.7531) (P-1800,0.7517)};
+\legend{precision, recall, pred/ref}
+\end{axis}
+\end{tikzpicture}
+\caption{precision、recall 与 \code{pred/ref} 的校准权衡。高 precision 设置提高误检控制，但候选音规模明显偏低。}
+\label{fig:calibration_tradeoff}
+\end{figure}

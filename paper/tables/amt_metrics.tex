@@ -1,0 +1,20 @@
+\begin{table}[H]
+\centering
+\caption{\code{val\_calib512} 上的最终 AMT 指标}
+\label{tab:amt_metrics}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrrrr}
+\toprule
+模型 & P & R & note-F1 & offset-F1 & pred/ref & chord R & long 0.5--2s & long >2s \\
+\midrule
+v13\_best & 0.5400 & 0.5288 & 0.5344 & 0.2538 & 0.979 & 0.5055 & 0.3428 & 0.0836 \\
+v15\_best & 0.5932 & 0.5671 & 0.5799 & 0.2880 & 0.956 & 0.5469 & 0.3020 & 0.0540 \\
+v19\_selected & 0.6916 & 0.5208 & 0.5942 & 0.3016 & 0.753 & 0.4982 & 0.3975 & 0.0717 \\
+v19\_step1800 & 0.6897 & 0.5184 & 0.5919 & 0.2995 & 0.752 & 0.4939 & 0.4066 & 0.0738 \\
+\bottomrule
+\end{tabular}
+}
+
+\vspace{2mm}
+\footnotesize 数据来源：\code{outputs/eval\_final\_mainline/final\_metrics.csv/json}。long 0.5--2s 与 long >2s 表示对应时长分桶的 duration ratio。
+\end{table}

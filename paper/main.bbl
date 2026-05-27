@@ -1,0 +1,58 @@
+\begin{thebibliography}{10}
+
+\bibitem{hawthorne2018onsets}
+Curtis Hawthorne, Erich Elsen, Jialin Song, Adam Roberts, Ian Simon, Colin Raffel, Jesse Engel, Sageev Oore, and Douglas Eck.
+\newblock Onsets and frames: Dual-objective piano transcription.
+\newblock In {\em Proceedings of the 19th International Society for Music Information Retrieval Conference}, pages 50--57, 2018.
+
+\bibitem{kong2021highres}
+Qiuqiang Kong, Bochen Li, Xuchen Song, Yuan Wan, and Yuxuan Wang.
+\newblock High-resolution piano transcription with pedals by regressing onset and offset times.
+\newblock {\em IEEE/ACM Transactions on Audio, Speech, and Language Processing}, 29:3707--3717, 2021.
+
+\bibitem{gardner2022mt3}
+Josh Gardner, Ian Simon, Ethan Manilow, Curtis Hawthorne, and Jesse Engel.
+\newblock Mt3: Multi-task multitrack music transcription.
+\newblock In {\em International Conference on Learning Representations}, 2022.
+
+\bibitem{suzuki2021scoretransformer}
+Masahiro Suzuki.
+\newblock Score transformer: Generating musical score from note-level representation.
+\newblock In {\em Proceedings of the 3rd ACM International Conference on Multimedia in Asia}, pages 31:1--31:7, 2021.
+
+\bibitem{liu2022pm2s}
+Li~Liu, Qiuqiang Kong, Veronica Morfi, and Emmanouil Benetos.
+\newblock Performance {MIDI}-to-score conversion by neural beat tracking.
+\newblock In {\em Proceedings of the 23rd International Society for Music Information Retrieval Conference}, pages 414--421, Bengaluru, India, 2022.
+
+\bibitem{beyer2024midi2score}
+Tim Beyer and Angela Dai.
+\newblock End-to-end piano performance-{MIDI} to score conversion with transformers.
+\newblock In {\em Proceedings of the 25th International Society for Music Information Retrieval Conference}, 2024.
+
+\bibitem{hawthorne2019maestro}
+Curtis Hawthorne, Andriy Stasyuk, Adam Roberts, Ian Simon, Cheng-Zhi~Anna Huang, Sander Dieleman, Erich Elsen, Jesse Engel, and Douglas Eck.
+\newblock Enabling factorized piano music modeling and generation with the {MAESTRO} dataset.
+\newblock In {\em International Conference on Learning Representations}, 2019.
+
+\bibitem{cuthbert2010music21}
+Michael~Scott Cuthbert and Christopher Ariza.
+\newblock music21: A toolkit for computer-aided musicology and symbolic music data.
+\newblock In {\em Proceedings of the 11th International Society for Music Information Retrieval Conference}, pages 637--642, 2010.
+
+\bibitem{basicpitch2022}
+{Spotify Research}.
+\newblock Basic pitch: An open source {MIDI} converter from spotify.
+\newblock \url{https://basicpitch.spotify.com/about}, 2022.
+\newblock Accessed 2026-05-25.
+
+\bibitem{benetos2019overview}
+Emmanouil Benetos, Simon Dixon, Zhiyao Duan, and Sebastian Ewert.
+\newblock Automatic music transcription: An overview.
+\newblock {\em IEEE Signal Processing Magazine}, 36(1):20--30, 2019.
+
+\bibitem{toyama2023hft}
+Keisuke Toyama, Taketo Akama, Yukara Ikemiya, and Kazuyoshi Yoshii.
+\newblock Automatic piano transcription with hierarchical frequency-time transformer, 2023.
+
+\end{thebibliography}

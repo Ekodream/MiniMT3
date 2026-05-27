@@ -1,0 +1,23 @@
+\begin{tikzpicture}[
+  font=\small,
+  node distance=6mm and 6mm,
+  block/.style={draw, rounded corners=2pt, align=center, minimum width=24mm, minimum height=9mm, fill=blue!5},
+  output/.style={draw, rounded corners=2pt, align=center, minimum width=25mm, minimum height=9mm, fill=orange!10},
+  arrow/.style={-{Latex[length=2mm]}, thick}
+]
+\node[block] (notes) {事件级音符};
+\node[block, right=of notes] (clean) {短音过滤\\重复合并};
+\node[block, right=of clean] (grid) {拍点网格\\小节量化};
+\node[block, right=of grid] (voice) {双谱表\\双声部};
+\node[block, below=8mm of grid] (lock) {和弦锁定\\长音连线};
+\node[block, right=of voice] (rests) {冗余休止符\\抑制};
+\node[output, right=of rests] (xml) {MusicXML};
+
+\draw[arrow] (notes) -- (clean);
+\draw[arrow] (clean) -- (grid);
+\draw[arrow] (grid) -- (voice);
+\draw[arrow] (grid) -- (lock);
+\draw[arrow] (lock) -| (voice);
+\draw[arrow] (voice) -- (rests);
+\draw[arrow] (rests) -- (xml);
+\end{tikzpicture}

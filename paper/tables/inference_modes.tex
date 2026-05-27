@@ -1,0 +1,16 @@
+\begin{table}[H]
+\centering
+\caption{最终推理模式与使用场景}
+\label{tab:inference_modes}
+\begin{tabularx}{\textwidth}{l l X}
+\toprule
+模式 & 默认模型 & 使用场景 \\
+\midrule
+\code{MODE=analysis\_midi} & v15\_best & 输出演奏 MIDI 与数值分析结果，保留较多演奏细节。 \\
+\code{MODE=score\_demo} & v15\_best & 输出平衡展示谱，适合默认 demo 和项目展示。 \\
+\code{MODE=hybrid\_score} & v13+v19 & 当前展示候选，用 v13 保持干净，用 v19 补和弦与长音。 \\
+\code{MODE=hybrid\_f1} & v13+v19 & 指标诊断模式，补音预算更宽，不作为默认展示谱。 \\
+\code{MODE=v13\_clean} & v13\_best & 最干净谱面对照，用于检查 score pipeline 是否回退。 \\
+\bottomrule
+\end{tabularx}
+\end{table}

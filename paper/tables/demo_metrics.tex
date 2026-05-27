@@ -1,0 +1,19 @@
+\begin{table}[H]
+\centering
+\caption{Test\_new 展示谱质量指标}
+\label{tab:demo_metrics}
+\begin{tabular}{lrrrrrr}
+\toprule
+输出 & perf notes & score notes & score/perf & rests & chord vert. & collisions \\
+\midrule
+v13 score & 514 & 607 & 1.181 & 2 & 0.384 & 7 \\
+v13+v15 hybrid & 585 & 702 & 1.200 & 2 & 0.447 & 12 \\
+v13+v19 hybrid & 598 & 714 & 1.194 & 2 & 0.462 & 13 \\
+v15 score & 1425 & 1775 & 1.246 & 0 & 0.840 & 154 \\
+v19 score & 1233 & 1518 & 1.231 & 0 & 0.763 & 73 \\
+\bottomrule
+\end{tabular}
+
+\vspace{2mm}
+\footnotesize 数据来源：\code{outputs/demo\_compare/final\_demo\_report.json}。chord vert. 为和弦垂直性指标，collisions 为声部碰撞计数。
+\end{table}

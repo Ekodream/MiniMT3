@@ -1,0 +1,15 @@
+\begin{table}[H]
+\centering
+\caption{收束阶段的主要消融结论}
+\label{tab:convergence_lessons}
+\begin{tabularx}{\textwidth}{l X X}
+\toprule
+现象 & 观察 & 结论 \\
+\midrule
+继续增大模型 & v15/v19 均为 171.33M，但 v19 虽 F1 略高，\code{pred/ref} 只有 0.753。 & 参数规模不是唯一瓶颈，阈值、训练目标和数据分布会决定模型是过生成还是欠生成。 \\
+直接用高候选谱面 & v15/v19 直接谱面 chord verticality 高，但 voice collision 明显上升。 & 高 recall MIDI 不能直接等同于可读 MusicXML，必须有独立谱面层。 \\
+只用干净 base & v13 visible rests 和碰撞较低，但和弦垂直性不足。 & 过度保守会产生漏音和和弦缺音，需要上下文约束的补音机制。 \\
+hybrid rescue & v13+v19 在 Test\_new 上提高 chord verticality，同时保持 rests 为 2。 & 辅助模型应只在和弦、长音和重复长音延长等受支持场景中介入。 \\
+\bottomrule
+\end{tabularx}
+\end{table}

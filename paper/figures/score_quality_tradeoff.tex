@@ -1,0 +1,30 @@
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{groupplot}[
+    group style={group size=2 by 1, horizontal sep=1.1cm},
+    width=0.47\linewidth,
+    height=6cm,
+    ybar,
+    symbolic x coords={Base,H15,H19,Balanced,Precision},
+    xtick=data,
+    x tick label style={rotate=30,anchor=east,font=\scriptsize},
+    enlarge x limits=0.18,
+]
+\nextgroupplot[
+    ymin=0,
+    ymax=0.9,
+    ylabel={chord verticality},
+]
+\addplot coordinates {(Base,0.384) (H15,0.447) (H19,0.462) (Balanced,0.840) (Precision,0.763)};
+\nextgroupplot[
+    ymin=0,
+    ymax=220,
+    ylabel={voice collisions},
+]
+\addplot coordinates {(Base,7) (H15,12) (H19,13) (Balanced,154) (Precision,73)};
+\end{groupplot}
+\end{tikzpicture}
+\caption{Test\_new 展示谱中的和弦垂直性与声部碰撞。高密度候选提高垂直音组比例，同时显著增加声部碰撞；混合修正在两者之间取得折中。}
+\label{fig:score_quality_tradeoff}
+\end{figure}

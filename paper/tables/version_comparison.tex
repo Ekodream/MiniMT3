@@ -1,0 +1,15 @@
+\begin{table}[H]
+\centering
+\caption{最终候选设置及实验角色}
+\label{tab:version_comparison}
+\begin{tabularx}{\textwidth}{l l l X}
+\toprule
+候选设置 & 参数量 & 实验角色 & 结果解释 \\
+\midrule
+v13\_best & 64.89M & 保守候选 & 谱面干净，候选音规模接近参考；主要不足是漏音和和弦缺音。 \\
+v15\_best & 171.33M & 均衡候选 & note-F1、recall 与候选音规模较均衡，适合作为演奏 MIDI 与数值分析主候选。 \\
+v19\_selected & 171.33M & 高置信候选 & 误检控制和 offset 较好，但候选音规模偏低；适合作为长音与高置信补音辅助。 \\
+v13+v19 hybrid & 组合模型 & 混合修正候选 & 以保守候选维持谱面稳定，并在上下文支撑下补充和弦与长音；尚无同口径 full-val 固化记录。 \\
+\bottomrule
+\end{tabularx}
+\end{table}

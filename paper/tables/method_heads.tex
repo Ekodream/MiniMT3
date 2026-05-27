@@ -1,0 +1,19 @@
+\begin{table}[H]
+\centering
+\caption{多任务预测分支及其在事件恢复中的作用}
+\label{tab:method_heads}
+\small
+\begin{tabularx}{\linewidth}{lllX}
+\toprule
+分支 & 目标形态 & 主要监督 & 解码阶段作用 \\
+\midrule
+onset & $T \times 88$ & 击键开始 & 作为新音触发的主要证据，约束 frame 不能单独产生新音。 \\
+frame & $T \times 88$ & 持续发声 & 描述音符持续区间，辅助判断弱起音和长音保持。 \\
+offset & $T \times 88$ & 击键结束 & 提供结束边界，减少长音过早截断或过度延长。 \\
+velocity & $T \times 88$ & onset 位置力度 & 估计 MIDI 力度，服务演奏级输出和弱音分析。 \\
+pedal & $T \times 3$ & 踏板状态 & 辅助恢复踏板保持、低音延音和连奏效果。 \\
+duration & $T \times 88$ & 音符时值 & 与 frame、offset 共同修正结束时间。 \\
+time-shift & $T \times d$ & 起止时间偏移 & 细化帧级时间定位，降低 hop size 带来的量化误差。 \\
+\bottomrule
+\end{tabularx}
+\end{table}

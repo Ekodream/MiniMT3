@@ -1,0 +1,16 @@
+\begin{table}[H]
+\centering
+\caption{实验问题与评价指标}
+\label{tab:research_questions}
+\small
+\begin{tabularx}{\linewidth}{lX X}
+\toprule
+编号 & 实验问题 & 主要指标 \\
+\midrule
+RQ1 & 不同候选系统在事件级转录中如何权衡准确率、召回率与候选音规模？ & precision、recall、note-F1、\code{pred/ref} \\
+RQ2 & 模型容量与校准策略是否稳定改善 note-F1、offset-F1 和长音恢复？ & 参数量、offset-F1、duration ratio、truncated rate \\
+RQ3 & 谱面整理层能否在保持音符结构的同时改善 MusicXML 可读性？ & score/performance notes、visible rests、voice collisions \\
+RQ4 & 受上下文约束的混合修正是否改善和弦、长音和漏音问题？ & chord recall、complete chord rate、chord verticality、long-note tie rate \\
+\bottomrule
+\end{tabularx}
+\end{table}

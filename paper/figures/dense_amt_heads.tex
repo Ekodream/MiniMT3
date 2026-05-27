@@ -1,0 +1,23 @@
+\begin{tikzpicture}[
+  font=\small,
+  node distance=7mm and 9mm,
+  block/.style={draw, rounded corners=2pt, align=center, minimum width=29mm, minimum height=10mm, fill=blue!5},
+  head/.style={draw, rounded corners=2pt, align=center, minimum width=24mm, minimum height=8mm, fill=orange!10},
+  arrow/.style={-{Latex[length=2mm]}, thick}
+]
+\node[block] (mel) {log-mel\\特征};
+\node[block, right=of mel] (encoder) {声学编码器\\CNN/CRNN/Transformer};
+\node[block, right=of encoder] (shared) {时频上下文\\隐表示};
+
+\node[head, above right=2mm and 8mm of shared] (onset) {onset\\新音开始};
+\node[head, right=8mm of shared] (frame) {frame\\持续状态};
+\node[head, below right=2mm and 8mm of shared] (offset) {offset\\结束边界};
+\node[head, below=7mm of offset] (duration) {velocity / pedal / duration\\辅助属性};
+
+\draw[arrow] (mel) -- (encoder);
+\draw[arrow] (encoder) -- (shared);
+\draw[arrow] (shared) -- (onset);
+\draw[arrow] (shared) -- (frame);
+\draw[arrow] (shared) -- (offset);
+\draw[arrow] (shared) |- (duration);
+\end{tikzpicture}
